@@ -26,77 +26,119 @@ st.caption("제20~22대 국회의원 총선거 자료를 활용한 인구 대표
 st.info("모든 분석은 이 페이지에 순서대로 표시됩니다. 별도 CSV 업로드나 분석 옵션 선택은 필요하지 않습니다.")
 
 
-# 중앙선관위 선거구별 선거인수 API 연결 상태 및 원자료 수집
+# 중앙선관위 선거구별 선거인수 API 연결 및 원자료 수집
+# 국회의원선거(sgTypecode=2)는 시도명(sdName)으로 조회한다.
+# wiwName은 지방의회의원 선거 조회용이므로 국회의원선거 요청에는 전달하지 않는다.
+from urllib.parse import unquote
+
 API_URL = "https://apis.data.go.kr/9760000/ElcntInfoInqireService/getElpcElcntInfoInqire"
 ELECTIONS = {"제20대": "20160413", "제21대": "20200415", "제22대": "20240410"}
+SIDO_NAMES = [
+    "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시",
+    "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원도",
+    "충청북도", "충청남도", "전라북도", "전라남도", "경상북도",
+    "경상남도", "제주특별자치도"
+]
 
 def get_service_key():
     try:
-        return st.secrets["SERVICE_KEY"]
+        return unquote(str(st.secrets["SERVICE_KEY"]).strip())
     except Exception:
         return None
 
-def fetch_district_electors(election_id, service_key):
-    rows = []
-    page = 1
-    while page <= 20:
-        params = {
-            "ServiceKey": service_key,
-            "sgId": election_id,
-            "sgTypecode": "2",
-            "pageNo": page,
-            "numOfRows": 1000,
-            "resultType": "json",
-        }
-        response = requests.get(API_URL, params=params, timeout=30)
-        response.raise_for_status()
+def parse_nec_response(response):
+    text_body = response.text
+    try:
         payload = response.json()
-        root = payload.get("getElpcElcntInfoInqire", payload)
-        header = root.get("header", {}) if isinstance(root, dict) else {}
-        body = root.get("body", {}) if isinstance(root, dict) else {}
-        if header and str(header.get("resultCode", "00")) not in ("00", "0", "INFO-000"):
-            raise RuntimeError(f"API 응답 오류: {header.get('resultCode')} / {header.get('resultMsg')}")
-        items = body.get("items", {}).get("item", []) if isinstance(body, dict) else []
-        if isinstance(items, dict):
-            items = [items]
+    except Exception:
+        import xml.etree.ElementTree as ET
+        try:
+            root_xml = ET.fromstring(text_body)
+            payload = {child.tag: child.text for child in root_xml}
+        except Exception:
+            raise RuntimeError(f"응답 해석 실패. HTTP {response.status_code}, 본문={text_body[:700]}")
+    root = payload.get("getElpcElcntInfoInqire", payload) if isinstance(payload, dict) else {}
+    header = root.get("header", {}) if isinstance(root, dict) else {}
+    body = root.get("body", {}) if isinstance(root, dict) else {}
+    code = str(header.get("resultCode", "")) if isinstance(header, dict) else ""
+    msg = str(header.get("resultMsg", "")) if isinstance(header, dict) else ""
+    if code and code not in ("00", "0", "INFO-000"):
+        raise RuntimeError(f"API 오류 {code}: {msg}; 응답={text_body[:500]}")
+    items = []
+    if isinstance(body, dict):
+        wrapped = body.get("items", {})
+        if isinstance(wrapped, dict): items = wrapped.get("item", [])
+        elif isinstance(wrapped, list): items = wrapped
+    if isinstance(items, dict): items = [items]
+    if not items and isinstance(root, dict):
+        items = root.get("item", [])
+        if isinstance(items, dict): items = [items]
+    total = None
+    if isinstance(body, dict):
+        try: total = int(body.get("totalCount"))
+        except (TypeError, ValueError): pass
+    return items or [], total, payload
+
+def call_district_electors(election_id, service_key, sido_name, page=1, rows=1000):
+    params = {
+        "serviceKey": service_key, "pageNo": page, "numOfRows": rows,
+        "resultType": "json", "sgId": election_id, "sgTypecode": "2",
+        "sdName": sido_name
+        # wiwName deliberately omitted for National Assembly elections.
+    }
+    response = requests.get(API_URL, params=params, timeout=40)
+    items, total, payload = parse_nec_response(response)
+    return items, total, payload, response
+
+def fetch_sido_for_election(election_id, service_key, sido_name):
+    collected=[]
+    for page in range(1, 31):
+        items, total, payload, response = call_district_electors(election_id, service_key, sido_name, page, 1000)
         if not items:
-            # 일부 공공데이터 API는 items 래퍼 없이 item을 반환
-            items = root.get("item", []) if isinstance(root, dict) else []
-            if isinstance(items, dict): items = [items]
-        if not items:
+            if page == 1:
+                raise RuntimeError(f"{sido_name}: 0건. HTTP={response.status_code}, 응답={response.text[:700]}")
             break
-        rows.extend(items)
-        total = int(body.get("totalCount", len(rows))) if isinstance(body, dict) else len(rows)
-        if len(rows) >= total:
-            break
-        page += 1
-    return pd.DataFrame(rows)
+        collected.extend(items)
+        if (total is not None and len(collected) >= total) or len(items) < 1000: break
+    return collected
 
 with st.expander("중앙선관위 API 연결 및 선거구별 유권자 원자료 수집", expanded=False):
-    st.markdown("Streamlit Secrets에 저장한 `SERVICE_KEY`를 사용해 제20·21·22대 국회의원선거의 선거구별 선거인수 API를 호출합니다.")
-    if st.button("선거구별 선거인수 API 테스트 및 수집", key="fetch_official_electors"):
-        key = get_service_key()
-        if not key:
-            st.error("SERVICE_KEY를 찾지 못했습니다. Streamlit Cloud → App settings → Secrets에 SERVICE_KEY = \"발급키\" 형식으로 저장해 주세요.")
-        else:
-            collected = []
-            for label, election_id in ELECTIONS.items():
-                try:
-                    df_api = fetch_district_electors(election_id, key)
-                    if not df_api.empty:
-                        df_api.insert(0, "총선", label)
-                        df_api.insert(1, "선거ID", election_id)
-                        collected.append(df_api)
-                    st.success(f"{label}: {len(df_api)}건 수신")
-                except Exception as exc:
-                    st.error(f"{label} 조회 실패: {exc}")
-            if collected:
-                raw = pd.concat(collected, ignore_index=True)
-                st.dataframe(raw.head(30), use_container_width=True)
-                st.download_button("수집된 선거구별 유권자 원자료 CSV 다운로드", raw.to_csv(index=False, encoding="utf-8-sig"), file_name="district_electors_20_22.csv", mime="text/csv")
-                st.caption("API 원응답 필드를 보존한 파일입니다. 선거구명·확정선거인수 필드를 검증한 뒤 분석용 표준 컬럼으로 변환해야 합니다.")
-            else:
-                st.warning("수집된 데이터가 없습니다. API의 선거ID·응답 형식·서비스키 승인 상태를 확인해야 합니다.")
+    st.markdown("Streamlit Secrets의 `SERVICE_KEY`를 사용합니다. 국회의원선거는 `sgTypecode=2`, `sdName`으로 조회하며 `wiwName`은 전달하지 않습니다.")
+    key = get_service_key()
+    c1, c2 = st.columns(2)
+    with c1: test_clicked = st.button("서울특별시 테스트 (제20~22대)", key="test_nec_seoul")
+    with c2: collect_clicked = st.button("전국 20~22대 전체 수집", key="fetch_official_electors")
+    if not key:
+        st.error('SERVICE_KEY를 찾지 못했습니다. Streamlit Cloud → App settings → Secrets에 SERVICE_KEY = "발급키" 형식으로 저장해 주세요.')
+    if test_clicked and key:
+        for label, eid in ELECTIONS.items():
+            try:
+                items, total, payload, response = call_district_electors(eid, key, "서울특별시")
+                st.success(f"{label}: 서울특별시 {len(items)}건 수신 (HTTP {response.status_code})")
+                if items: st.dataframe(pd.DataFrame(items), use_container_width=True)
+                else: st.warning(f"{label}: 0건. API 응답: {json.dumps(payload, ensure_ascii=False)[:1200]}")
+            except Exception as exc: st.error(f"{label} 테스트 실패: {exc}")
+    if collect_clicked and key:
+        collected=[]; errors=[]
+        tasks=[(label,eid,sido) for label,eid in ELECTIONS.items() for sido in SIDO_NAMES]
+        progress=st.progress(0)
+        for i,(label,eid,sido) in enumerate(tasks,1):
+            try:
+                rows=fetch_sido_for_election(eid,key,sido)
+                for row in rows:
+                    row["총선"]=label; row["선거ID"]=eid; row["조회시도"]=sido
+                collected.extend(rows)
+            except Exception as exc: errors.append(f"{label}/{sido}: {exc}")
+            progress.progress(i/len(tasks))
+        if collected:
+            raw=pd.DataFrame(collected)
+            st.success(f"전체 수집 결과: {len(raw):,}건")
+            st.dataframe(raw.head(50),use_container_width=True)
+            st.download_button("제20~22대 선거구별 선거인수 CSV 다운로드",raw.to_csv(index=False,encoding="utf-8-sig"),file_name="district_electors_20_22.csv",mime="text/csv")
+        if errors:
+            with st.expander(f"조회 오류 상세 ({len(errors)}건)"):
+                for error in errors: st.error(error)
+        if not collected: st.error("수집된 자료가 없습니다. 오류 상세의 API 응답코드와 메시지를 확인해 주세요.")
 
 # All figures below are national totals / officially reported summary figures.
 # District-level raw population and district-level elector counts are not bundled unless verified.
