@@ -110,10 +110,16 @@ def map_figure(geo, table, value_col, title, colors="Blues", categorical=False):
     # Pass only the selected constituency features to Plotly; this prevents the full-country
     # geometry/ocean canvas from being painted as one solid block when a region filter is active.
     selected=set(locs)
-    geo_subset={"type":"FeatureCollection","features":[
-        f for f in geo.get("features",[])
-        if str(f.get("properties",{}).get("SGG_Code","")).strip() in selected
-    ]}
+    normalized_features=[]
+    for original in geo.get("features",[]):
+        feature=json.loads(json.dumps(original))
+        props=feature.setdefault("properties",{})
+        # Plotly performs a strict type match: locations are strings, so normalize
+        # numeric SGG_Code values in the GeoJSON to strings as well.
+        props["SGG_Code"]=str(props.get("SGG_Code","")).strip()
+        if props["SGG_Code"] in selected:
+            normalized_features.append(feature)
+    geo_subset={"type":"FeatureCollection","features":normalized_features}
     if not geo_subset["features"]:
         raise ValueError("선택한 지역의 선거구 코드와 지도 경계가 일치하지 않습니다.")
     fig=go.Figure(go.Choropleth(
@@ -266,6 +272,28 @@ fig.update_layout(height=450,margin=dict(l=10,r=10,t=25,b=10))
 fig.update_xaxes(title="표의 등가성 지수")
 fig.update_yaxes(title="모형상 선거구 수")
 st.plotly_chart(fig,use_container_width=True)
+
+# Proportion of constituencies above/below the equal-representation index (=1)
+above=int((idx>1).sum())
+below=int((idx<1).sum())
+equal=int((np.isclose(idx,1,atol=1e-9)).sum())
+ratio_table=pd.DataFrame({
+    "구분":["지수 1 초과","지수 1 미만","지수 1"],
+    "선거구 수":[above,below,equal],
+})
+ratio_table["비율(%)"]=ratio_table["선거구 수"]/len(idx)*100
+st.markdown("**표의 등가성 지수 1 초과·미만 선거구 비율**")
+ratio_fig=px.bar(
+    ratio_table[ratio_table["선거구 수"]>0],
+    x="구분",y="비율(%)",text=ratio_table.loc[ratio_table["선거구 수"]>0,"비율(%)"].map(lambda v:f"{v:.1f}%"),
+    color="구분",
+    color_discrete_map={"지수 1 초과":"#2878b5","지수 1 미만":"#e07a5f","지수 1":"#9ca3af"}
+)
+ratio_fig.update_traces(textposition="outside",cliponaxis=False)
+ratio_fig.update_layout(height=350,showlegend=False,margin=dict(l=10,r=10,t=15,b=10),yaxis_title="선거구 비율(%)",xaxis_title="")
+ratio_fig.update_yaxes(range=[0,max(100,float(ratio_table["비율(%)"].max())*1.18)])
+st.plotly_chart(ratio_fig,use_container_width=True)
+st.caption(f"지수 1 초과 {above}개({above/len(idx)*100:.1f}%), 지수 1 미만 {below}개({below/len(idx)*100:.1f}%). 현재 선거구별 공식 인구 원자료가 완전하지 않아, 이 비율은 선택한 총선의 공식 평균·최대·최소를 반영한 모형 추정 분포에서 산출한 값입니다.")
 
 # 5. Population vs registered voters (22nd election, constituency level)
 st.divider()
