@@ -1,404 +1,442 @@
-from __future__ import annotations
 from pathlib import Path
-import io, json, re
+import io
+import json
+import math
+import textwrap
+
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import folium
+from streamlit_folium import st_folium
+import geopandas as gpd
 import requests
 import streamlit as st
 
-BASE = Path(__file__).parent
-DATA = BASE / 'data'
-GEOJSON_URL = 'https://raw.githubusercontent.com/OhmyNews/2024_22_elec_map/main/2024_22_Elec_simplify.json'
+HERE = Path(__file__).parent
+DATA = HERE / "data"
 
-st.set_page_config(page_title='국회의원 지역구 인구와 표의 등가성 분석', page_icon='🗳️', layout='wide')
-st.markdown('''
-<style>
-.block-container{max-width:1800px;padding-top:1.3rem;padding-bottom:2.4rem}
-h1{font-weight:800!important;letter-spacing:-.04em}
-h2{font-weight:750!important;letter-spacing:-.025em}
-h3{font-weight:700!important}
-[data-testid="stMetric"]{background:#f5f8fc;border:1px solid #e7edf4;padding:13px 16px;border-radius:12px}
-[data-testid="stVerticalBlockBorderWrapper"]{border-radius:13px}
-[data-testid="stAlert"]{border-radius:11px}
-div[data-testid="stSelectbox"] label{font-weight:650}
-</style>
-''', unsafe_allow_html=True)
+st.set_page_config(page_title="국회의원 지역구 인구와 표의 등가성 분석", layout="wide")
 
-OPTIONS = [
-    '1. 역대 총선별 선거구 최대·최소·평균 인구 변화',
-    '2. 선거구별 인구수 및 표의 등가성 지수',
-    '3. 인접 선거구와의 인구 차이',
-    '4. 총선별 표의 등가성 지수 분포',
-    '5. 총선 시기별 표의 등가성 변화 분석',
-    '6. 주민등록인구와 유권자수(선거인수)의 관계 분석',
-]
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.2rem; padding-bottom: 1.4rem;}
+    h1 {margin-bottom: 0.2rem;}
+    .section-title {font-size: 1.35rem; font-weight: 700; margin: 0.4rem 0 0.5rem 0;}
+    .muted {color: #666; font-size: 0.95rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ---------- data utilities ----------
-def read_csv_safe(source):
-    if isinstance(source, bytes):
-        raw = source
-    else:
-        raw = Path(source).read_bytes()
-    for enc in ('utf-8-sig','cp949','utf-8'):
-        try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc)
-        except Exception:
-            continue
-    raise ValueError('CSV 인코딩을 읽을 수 없습니다. UTF-8 또는 CP949로 저장해 주세요.')
+st.title("국회의원 지역구 인구와 표의 등가성 분석")
+st.caption("첫 화면에서 모든 분석이 한 번에 보이는 버전입니다.")
 
-def normalize_columns(df):
-    if df is None or df.empty:
-        return pd.DataFrame() if df is None else df.copy()
-    x=df.copy()
-    x.columns=[str(c).replace('\ufeff','').strip() for c in x.columns]
-    aliases={
-        '시도명':'시도','지역구':'선거구','선거구명':'선거구','선거구명칭':'선거구',
-        '주민등록인구수':'주민등록인구','인구수':'주민등록인구','인구':'주민등록인구',
-        '선거인 수':'선거인수','유권자수':'선거인수','선거인수(명)':'선거인수',
-        '총선명':'총선','회차':'총선','선거연도':'연도','평균':'평균인구',
-        '최대':'최대인구','최소':'최소인구','선거구 수':'선거구수',
-        'SIDO_SGG명':'SIDO_SGG','선거구키':'SIDO_SGG'
-    }
-    ren={k:v for k,v in aliases.items() if k in x.columns and v not in x.columns}
-    x=x.rename(columns=ren)
-    for c in ['연도','최대인구','최소인구','평균인구','선거구수','주민등록인구','선거인수','투표자수','위도','경도']:
-        if c in x.columns:
-            x[c]=pd.to_numeric(x[c].astype(str).str.replace(',','',regex=False).str.replace('명','',regex=False).str.strip(),errors='coerce')
-    return x
+st.info(
+    "선택칸은 없애고 1~5번 분석을 모두 한 화면에 배치했습니다. "
+    "2·3번은 선거구별 인구 CSV와 GeoJSON 경계가 있으면 실제 색상 분석이 동작합니다."
+)
 
-def get_csv(filename, uploaded_key=None):
-    uploads=st.session_state.get('uploads',{})
-    key=uploaded_key or filename
-    if key in uploads:
-        return normalize_columns(read_csv_safe(uploads[key]))
-    p=DATA/filename
-    if p.exists():
-        try: return normalize_columns(read_csv_safe(p))
-        except Exception: return pd.DataFrame()
-    return pd.DataFrame()
-
-def has(df, cols):
-    return isinstance(df,pd.DataFrame) and not df.empty and all(c in df.columns for c in cols)
-
-def notice(text):
-    st.info(text, icon='ℹ️')
-
-def won(v):
-    try: return f'{float(v):,.0f}'
-    except Exception: return '자료 없음'
-
-def norm_key(s):
-    return re.sub(r'\s+','',str(s)).replace('특별자치시','').replace('특별자치도','')
-
-@st.cache_data(show_spinner='제22대 선거구 경계 불러오는 중…', ttl=86400)
-def load_remote_geojson():
-    r=requests.get(GEOJSON_URL,timeout=25,headers={'User-Agent':'ElectionDashboard/1.0'})
-    r.raise_for_status()
-    obj=r.json()
-    if not obj.get('features'):
-        raise ValueError('GeoJSON에 선거구 경계가 없습니다.')
-    return obj
-
-def load_geojson():
-    local=DATA/'constituencies_22.geojson'
-    if local.exists():
-        return json.loads(local.read_text(encoding='utf-8'))
-    raw=st.session_state.get('uploads',{}).get('constituencies_22.geojson')
-    if raw:
-        return json.loads(raw.decode('utf-8'))
-    return load_remote_geojson()
+GEOJSON_URL = "https://raw.githubusercontent.com/OhmyNews/2024_22_elec_map/main/2024_22_Elec_simplify.json"
 
 @st.cache_data(show_spinner=False)
-def make_adjacency(geojson_text):
-    # Shapely is used only for spatial adjacency; shared-boundary neighbors are preferred to point-only touches.
-    from shapely.geometry import shape
-    gj=json.loads(geojson_text)
-    feats=gj.get('features',[])
-    items=[]
-    for f in feats:
-        p=f.get('properties',{})
-        key=p.get('SIDO_SGG') or p.get('SIDO_SGG_NM') or p.get('SGG')
-        if key:
-            items.append((str(key),shape(f['geometry'])))
-    neighbors={k:[] for k,_ in items}
-    for i,(ka,ga) in enumerate(items):
-        for kb,gb in items[i+1:]:
+def load_history() -> pd.DataFrame:
+    path = DATA / "election_history_summary.csv"
+    if path.exists():
+        df = pd.read_csv(path)
+    else:
+        df = pd.DataFrame([
+            [20, 2016, 51465228, 246, 278945, 139473, 209209.0],
+            [21, 2020, 51826287, 253, 273129, 136565, 204847.0],
+            [22, 2024, 51558034, 254, 271716, 135858, 203787.0],
+        ], columns=["총선", "연도", "총인구", "지역구수", "최대인구", "최소인구", "평균인구"])
+    return df.sort_values("연도").reset_index(drop=True)
+
+@st.cache_data(show_spinner=False)
+def load_voters() -> pd.DataFrame:
+    path = DATA / "election_voter_summary.csv"
+    if path.exists():
+        df = pd.read_csv(path)
+    else:
+        df = pd.DataFrame([
+            [20, 2016, 51465228, 42100398],
+            [21, 2020, 51826287, 43994247],
+            [22, 2024, 51558034, 44251919],
+        ], columns=["총선", "연도", "주민등록인구", "선거인수"])
+    return df.sort_values("연도").reset_index(drop=True)
+
+def _norm(s: str) -> str:
+    return "".join(ch for ch in str(s).lower().strip() if ch.isalnum() or ch in ["가", "나", "다", "라", "마", "바", "사", "아", "자", "차", "카", "타", "파", "하"])
+
+def pick_col(df: pd.DataFrame, candidates) -> str | None:
+    norm_map = {_norm(c): c for c in df.columns}
+    for cand in candidates:
+        key = _norm(cand)
+        if key in norm_map:
+            return norm_map[key]
+    # partial match fallback
+    for cand in candidates:
+        key = _norm(cand)
+        for n, orig in norm_map.items():
+            if key in n or n in key:
+                return orig
+    return None
+
+@st.cache_data(show_spinner=False)
+def load_geojson() -> dict | None:
+    try:
+        r = requests.get(GEOJSON_URL, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("type") == "FeatureCollection":
+            return data
+    except Exception:
+        return None
+    return None
+
+def geojson_to_gdf(geojson: dict) -> gpd.GeoDataFrame:
+    features = geojson.get("features", [])
+    if not features:
+        return gpd.GeoDataFrame()
+    gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
+    # try to infer a readable label column
+    label_cols = ["SIDO_SGG", "sgg_nm", "sgg_name", "name", "NAME", "title", "district", "구역명"]
+    found = None
+    for c in label_cols:
+        if c in gdf.columns:
+            found = c
+            break
+    if found is None:
+        # pick first non-geometry object column
+        for c in gdf.columns:
+            if c != "geometry" and gdf[c].dtype == "object":
+                found = c
+                break
+    if found is None:
+        gdf["__label__"] = [f"구역 {i+1}" for i in range(len(gdf))]
+    else:
+        gdf["__label__"] = gdf[found].astype(str)
+    gdf["__key__"] = gdf["__label__"].map(_norm)
+    return gdf
+
+def load_constituency_data(uploaded_file=None) -> pd.DataFrame | None:
+    candidates = []
+    if uploaded_file is not None:
+        try:
+            candidates.append(pd.read_csv(uploaded_file))
+        except Exception:
+            pass
+    local = DATA / "constituency_population.csv"
+    if local.exists():
+        try:
+            candidates.append(pd.read_csv(local))
+        except Exception:
+            pass
+    template = DATA / "constituency_population_template.csv"
+    if template.exists() and not candidates:
+        try:
+            candidates.append(pd.read_csv(template))
+        except Exception:
+            pass
+    if not candidates:
+        return None
+    df = candidates[0].copy()
+    # normalize columns for easier downstream use
+    rename = {}
+    for col in df.columns:
+        n = _norm(col)
+        if n in ["총선", "electionyear", "year", "회차"]:
+            rename[col] = "총선"
+        elif n in ["선거구명", "선거구", "district", "sgg", "sggname", "name"]:
+            rename[col] = "선거구명"
+        elif n in ["시도", "지역", "sido", "region", "광역시도"]:
+            rename[col] = "시도"
+        elif n in ["주민등록인구", "인구", "population", "pop"]:
+            rename[col] = "주민등록인구"
+        elif n in ["선거인수", "유권자수", "voters", "electors", "electorcount"]:
+            rename[col] = "선거인수"
+        elif n in ["표의등가성지수", "등가성지수", "eqindex", "equalvoteindex"]:
+            rename[col] = "표의등가성지수"
+        elif n in ["위도", "lat", "latitude"]:
+            rename[col] = "위도"
+        elif n in ["경도", "lon", "lng", "longitude"]:
+            rename[col] = "경도"
+    df = df.rename(columns=rename)
+    return df
+
+def compute_equal_vote_index(df: pd.DataFrame) -> pd.Series:
+    if "주민등록인구" not in df.columns:
+        return pd.Series(dtype=float)
+    base = pd.to_numeric(df["주민등록인구"], errors="coerce").mean()
+    return base / pd.to_numeric(df["주민등록인구"], errors="coerce")
+
+def compute_neighbors(gdf: gpd.GeoDataFrame) -> dict[int, set[int]]:
+    neighbors = {i: set() for i in gdf.index}
+    if gdf.empty:
+        return neighbors
+    sindex = gdf.sindex
+    for i, geom in gdf.geometry.items():
+        try:
+            candidates = list(sindex.intersection(geom.bounds))
+        except Exception:
+            candidates = list(gdf.index)
+        for j in candidates:
+            if j <= i:
+                continue
             try:
-                if ga.boundary.intersection(gb.boundary).length > 1e-7:
-                    neighbors[ka].append(kb); neighbors[kb].append(ka)
+                g2 = gdf.at[j, "geometry"]
+                if geom.touches(g2):
+                    inter = geom.intersection(g2)
+                    if not inter.is_empty and inter.length > 0:
+                        neighbors[i].add(j)
+                        neighbors[j].add(i)
             except Exception:
                 continue
     return neighbors
 
-def choropleth(geo, table, value_col, title, color_scale='Blues', categorical=False, selected_region='전체'):
-    feats=geo.get('features',[])
-    keyset=[]; region_by_key={}
-    for f in feats:
-        p=f.get('properties',{})
-        k=p.get('SIDO_SGG') or p.get('SIDO_SGG_NM') or p.get('SGG')
-        if k:
-            keyset.append(str(k)); region_by_key[str(k)]=str(p.get('SIDO',''))
-    if selected_region!='전체':
-        keyset=[k for k in keyset if region_by_key.get(k)==selected_region]
-    if categorical:
-        # -1 = lower than neighbors (blue), 0 = equal (gray), +1 = higher (red)
-        cmap=[[0,'#3478c8'],[0.499,'#3478c8'],[0.5,'#a3a3a3'],[0.501,'#c94b4b'],[1,'#c94b4b']]
-        vals=table.set_index('SIDO_SGG')[value_col].to_dict() if has(table,['SIDO_SGG',value_col]) else {}
-        z=[vals.get(k,np.nan) for k in keyset]
-        colorscale=cmap; zmin=-1; zmax=1; cbar=dict(title='인접 평균 대비',tickvals=[-1,0,1],ticktext=['낮음','같음','높음'])
-    else:
-        vals=table.set_index('SIDO_SGG')[value_col].to_dict() if has(table,['SIDO_SGG',value_col]) else {}
-        z=[vals.get(k,np.nan) for k in keyset]
-        colorscale=color_scale; zmin=None; zmax=None; cbar=dict(title=title)
-    fig=go.Figure(go.Choropleth(
-        geojson=geo, featureidkey='properties.SIDO_SGG', locations=keyset, z=z,
-        colorscale=colorscale, zmin=zmin, zmax=zmax, marker_line_color='#8295a8', marker_line_width=.45,
-        colorbar=cbar, hovertemplate='%{location}<br>'+title+': %{z:,.0f}<extra></extra>'
-    ))
-    fig.update_geos(fitbounds='locations',visible=False,projection_type='mercator',center=dict(lat=36.2,lon=127.8))
-    fig.update_layout(height=690,margin=dict(l=0,r=0,t=8,b=0),paper_bgcolor='white',geo_bgcolor='white')
-    return fig
+def fallback_map(title: str, message: str, height: int = 600):
+    m = folium.Map(location=[36.2, 127.8], zoom_start=6, tiles="CartoDB positron", control_scale=False)
+    st.caption(message)
+    st_folium(m, height=height, use_container_width=True)
 
-# ---------- title and first screen ----------
-st.title('국회의원 지역구 인구와 표의 등가성 분석')
-st.caption('산업데이터시각화 프로젝트 · 인구 대표성의 지역 간 차이를 데이터로 탐색')
+def section_header(num: str, title: str):
+    st.markdown(f'<div class="section-title">{num}. {title}</div>', unsafe_allow_html=True)
 
+history = load_history()
+voters = load_voters()
+geojson = load_geojson()
+gdf = geojson_to_gdf(geojson) if geojson else None
+
+# ---------- 1 ----------
 with st.container(border=True):
-    st.subheader('분석 옵션 선택')
-    selected=st.selectbox('분석할 항목을 선택하세요',OPTIONS,index=0,label_visibility='collapsed')
+    section_header("1", "역대 총선별 선거구 최대·최소·평균 인구 변화")
+    st.caption("차트만 표시됩니다.")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=history["연도"], y=history["최대인구"], mode="lines+markers", name="최대",
+        hovertemplate="%{x}년<br>%{y:,.0f}명<extra></extra>"
+    ))
+    fig.add_trace(go.Scatter(
+        x=history["연도"], y=history["평균인구"], mode="lines+markers", name="평균",
+        hovertemplate="%{x}년<br>%{y:,.0f}명<extra></extra>"
+    ))
+    fig.add_trace(go.Scatter(
+        x=history["연도"], y=history["최소인구"], mode="lines+markers", name="최소",
+        hovertemplate="%{x}년<br>%{y:,.0f}명<extra></extra>"
+    ))
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10), legend_title_text="")
+    fig.update_yaxes(title="인구(명)", tickformat=",")
+    fig.update_xaxes(title="총선 연도")
+    st.plotly_chart(fig, use_container_width=True)
 
-# load all available files after option selection
-history=get_csv('election_history_summary.csv')
-const=get_csv('constituency_population.csv')
-historical=get_csv('historical_constituencies.csv')
-voters_nat=get_csv('election_voters_national.csv')
-voters_dist=get_csv('election_voters_district.csv')
+# ---------- 2 ----------
+with st.container(border=True):
+    section_header("2", "선거구별 인구수 및 표의 등가성 지수")
+    st.caption("지도 + 차트")
+    uploaded_const = st.file_uploader("선거구 인구 CSV 업로드", type=["csv"], key="u_const")
+    const_df = load_constituency_data(uploaded_const)
+    left, right = st.columns([1.05, 0.95], gap="large")
 
-# Optional in-session data loading; first page remains uncluttered.
-with st.expander('데이터 파일 추가·교체 (CSV / GeoJSON)',expanded=False):
-    st.write('공식 원자료를 올리면 해당 분석에 즉시 반영됩니다. 영구 반영하려면 같은 파일을 GitHub 저장소의 `data/` 폴더에도 업로드하세요.')
-    files=st.file_uploader('자료 여러 개 선택',type=['csv','json','geojson'],accept_multiple_files=True,key='all_data_upload')
-    if files:
-        st.session_state.setdefault('uploads',{})
-        for f in files:
-            st.session_state.uploads[f.name]=f.getvalue()
-        st.success('업로드 자료를 현재 세션에서 사용할 수 있습니다. 파일명은 아래 안내와 일치해야 합니다.')
-    st.markdown('**지원 파일명**')
-    st.code('''constituency_population.csv
-historical_constituencies.csv
-election_history_summary.csv
-election_voters_national.csv
-election_voters_district.csv
-constituencies_22.geojson''',language='text')
-
-# reload uploaded files after upload widget
-history=get_csv('election_history_summary.csv')
-const=get_csv('constituency_population.csv')
-historical=get_csv('historical_constituencies.csv')
-voters_nat=get_csv('election_voters_national.csv')
-voters_dist=get_csv('election_voters_district.csv')
-
-# ---------- 1. historical maximum/minimum/average ----------
-if selected.startswith('1.'):
-    st.header('역대 총선별 선거구 최대·최소·평균 인구 변화')
-    if has(history,['연도','총선','최대인구','최소인구','평균인구']):
-        t=history.dropna(subset=['연도','최대인구','최소인구','평균인구']).sort_values('연도')
-        fig=go.Figure()
-        for col,label in [('최대인구','최대 인구'),('평균인구','평균 인구'),('최소인구','최소 인구')]:
-            fig.add_trace(go.Scatter(x=t['연도'].astype(int),y=t[col],mode='lines+markers',name=label,
-                customdata=t['총선'],hovertemplate='%{customdata}<br>%{x}년<br>%{y:,.0f}명<extra></extra>'))
-        fig.update_layout(height=540,hovermode='x unified',legend_title_text='',margin=dict(l=10,r=15,t=25,b=10))
-        fig.update_xaxes(title='총선 연도',dtick=4,tickformat='d')
-        fig.update_yaxes(title='선거구 인구(명)',tickformat=',')
-        st.plotly_chart(fig,use_container_width=True)
-        st.dataframe(t[['총선','연도','선거구수','최대인구','평균인구','최소인구','인구기준일']].sort_values('연도',ascending=False),use_container_width=True,hide_index=True)
-        st.caption('인구기준일은 각 총선의 선거구 획정에 사용된 기준일입니다. 총선마다 법적 기준과 기준일이 달라질 수 있으므로 수치의 직접 비교에는 기준 차이를 함께 고려해야 합니다.')
-    else:
-        notice('election_history_summary.csv에 총선, 연도, 최대인구, 최소인구, 평균인구 열이 필요합니다.')
-
-# ---------- 2. constituency choropleth + top 10 ----------
-elif selected.startswith('2.'):
-    st.header('선거구별 인구수 및 표의 등가성 지수')
-    a,b,c=st.columns([1,1,1])
-    with a: metric=st.selectbox('지도 표시 기준',['주민등록인구','표의 등가성 지수'],key='map_metric')
-    with b: rank_metric=st.selectbox('Top 10 기준',['주민등록인구','표의 등가성 지수'],key='rank_metric')
-    with c: region='전체'
-    if has(const,['SIDO_SGG','시도','선거구','주민등록인구']):
-        data=const.copy().dropna(subset=['주민등록인구'])
-        data['주민등록인구']=pd.to_numeric(data['주민등록인구'],errors='coerce')
-        data=data.dropna(subset=['주민등록인구'])
-        data['표의 등가성 지수']=data['주민등록인구'].mean()/data['주민등록인구'].replace(0,np.nan)
-        regions=['전체']+sorted(data['시도'].dropna().astype(str).unique().tolist())
-        region=st.selectbox('지역 필터',regions,key='map_region')
-        if region!='전체': data=data[data['시도'].astype(str)==region]
-        map_value='주민등록인구' if metric=='주민등록인구' else '표의 등가성 지수'
-        try:
-            geo=load_geojson()
-            left,right=st.columns([1.05,.95],gap='large')
-            with left:
-                st.markdown('**제22대 국회의원 지역구 경계 지도**')
-                st.plotly_chart(choropleth(geo,data,map_value,map_value,'Blues' if metric=='주민등록인구' else 'RdYlBu'),use_container_width=True,config={'displayModeBar':True})
-                st.caption('경계: OhmyNews 2024_22_elec_map (MIT). 데이터 연결이 안 된 선거구는 회색/결측으로 표시됩니다.')
-            with right:
-                st.markdown(f'**{rank_metric} Top 10**')
-                if rank_metric=='표의 등가성 지수': data['표의 등가성 지수']=data['주민등록인구'].mean()/data['주민등록인구'].replace(0,np.nan)
-                top=data.nlargest(10,rank_metric)
-                if not top.empty:
-                    fig=px.bar(top.sort_values(rank_metric),x=rank_metric,y='선거구',orientation='h',color='시도',hover_data=['주민등록인구','표의 등가성 지수'])
-                    fig.update_layout(height=560,legend_title_text='',margin=dict(l=5,r=5,t=15,b=5))
-                    fig.update_xaxes(title='명' if rank_metric=='주민등록인구' else '지수')
-                    st.plotly_chart(fig,use_container_width=True)
-                    st.metric('분석에 포함된 선거구',f'{len(data):,}개')
-                else: notice('표시할 인구 자료가 없습니다.')
-        except Exception as e:
-            notice(f'선거구 경계 GeoJSON을 불러오지 못했습니다: {e}. 인터넷 연결을 확인하거나 `constituencies_22.geojson`을 업로드해 주세요.')
-    else:
-        notice('선거구별 실제 인구 자료가 아직 연결되지 않았습니다. data/constituency_population.csv에 254개 선거구의 공식 주민등록인구를 넣으면 지도 색상과 Top 10이 함께 작동합니다.')
-        try:
-            geo=load_geojson()
-            keys=[f.get('properties',{}).get('SIDO_SGG') for f in geo.get('features',[]) if f.get('properties',{}).get('SIDO_SGG')]
-            empty=pd.DataFrame({'SIDO_SGG':keys,'주민등록인구':np.nan})
-            st.plotly_chart(choropleth(geo,empty,'주민등록인구','주민등록인구'),use_container_width=True)
-        except Exception:
-            st.caption('지도 경계 파일은 앱 실행 시 GitHub 공개 저장소에서 자동으로 불러옵니다.')
-
-# ---------- 3. adjacency comparison map only ----------
-elif selected.startswith('3.'):
-    st.header('인접 선거구와의 인구 차이')
-    st.caption('각 선거구의 주민등록인구를 인접 선거구들의 평균과 비교합니다.')
-    if has(const,['SIDO_SGG','시도','선거구','주민등록인구']):
-        try:
-            geo=load_geojson()
-            neighbors=make_adjacency(json.dumps(geo,ensure_ascii=False))
-            data=const.copy().dropna(subset=['주민등록인구'])
-            data['주민등록인구']=pd.to_numeric(data['주민등록인구'],errors='coerce')
-            pop=data.set_index('SIDO_SGG')['주민등록인구'].to_dict()
-            rows=[]
-            tol=st.number_input('같음으로 처리할 허용 오차(명)',min_value=0,max_value=1000,value=0,step=10)
-            for key,ns in neighbors.items():
-                if key not in pop: continue
-                vals=[pop[n] for n in ns if n in pop and pd.notna(pop[n])]
-                if not vals: continue
-                avg=float(np.mean(vals)); diff=float(pop[key])-avg
-                state=0 if abs(diff)<=tol else (1 if diff>0 else -1)
-                rows.append({'SIDO_SGG':key,'인접선거구평균':avg,'인접평균대비차이':diff,'상태':state,'인접선거구수':len(vals)})
-            result=pd.DataFrame(rows)
-            regions=['전체']+sorted(data['시도'].dropna().astype(str).unique().tolist())
-            region=st.selectbox('지역 필터',regions,key='adj_region')
-            if region!='전체':
-                valid=set(data.loc[data['시도'].astype(str)==region,'SIDO_SGG'].astype(str))
-                result=result[result['SIDO_SGG'].isin(valid)]
-            if not result.empty:
-                fig=choropleth(geo,result,'상태','인접 평균 대비',categorical=True,selected_region=region)
-                st.plotly_chart(fig,use_container_width=True)
-                x,y,z=st.columns(3)
-                x.metric('인접 평균보다 인구가 많음',f'{int((result.상태==1).sum()):,}개')
-                y.metric('인접 평균보다 인구가 적음',f'{int((result.상태==-1).sum()):,}개')
-                z.metric('인접 평균과 같음',f'{int((result.상태==0).sum()):,}개')
-                st.markdown('🔴 빨간색: 인접 평균보다 많음　 🔵 파란색: 인접 평균보다 적음　 ⚪ 회색: 허용 오차 이내')
-                st.caption('인접성은 선거구 경계의 공유 경계 길이가 있는 경우로 계산했습니다. 꼭짓점만 접하는 선거구는 이웃으로 보지 않습니다.')
+    with left:
+        st.markdown("**지도**")
+        if const_df is None or const_df.empty:
+            fallback_map(
+                "선거구별 인구 지도",
+                "현재는 선거구별 인구 CSV가 없어 색칠 지도를 표시할 수 없습니다. "
+                "data/constituency_population.csv 또는 업로드 파일이 있으면 실제 색상이 들어갑니다.",
+                height=540,
+            )
+        else:
+            if geojson is None or gdf is None or gdf.empty:
+                st.warning("GeoJSON을 불러오지 못했습니다. 지도 색상은 계산할 수 있지만 폴리곤 경계가 필요합니다.")
             else:
-                notice('인접 선거구의 인구 자료를 연결할 수 없습니다. SIDO_SGG 값이 GeoJSON의 선거구 키와 정확히 일치하는지 확인해 주세요.')
-        except Exception as e:
-            notice(f'인접 선거구 계산에 실패했습니다: {e}. shapely 및 제22대 GeoJSON을 확인해 주세요.')
-    else:
-        notice('인접 선거구 비교를 위해 254개 선거구의 주민등록인구 CSV가 필요합니다. 경계 간 인접 관계는 GeoJSON으로 자동 계산하도록 구현했습니다.')
-        try:
-            geo=load_geojson(); empty=pd.DataFrame({'SIDO_SGG':[f.get('properties',{}).get('SIDO_SGG') for f in geo.get('features',[]) if f.get('properties',{}).get('SIDO_SGG')],'상태':np.nan})
-            st.plotly_chart(choropleth(geo,empty,'상태','인접 평균 대비',categorical=True),use_container_width=True)
-        except Exception: pass
+                pop_col = pick_col(const_df, ["주민등록인구", "population"])
+                name_col = pick_col(const_df, ["선거구명", "선거구", "district", "name"])
+                idx_col = pick_col(const_df, ["표의등가성지수", "등가성지수", "eqindex"])
+                if idx_col is None and pop_col is not None:
+                    const_df["표의등가성지수"] = compute_equal_vote_index(const_df)
+                    idx_col = "표의등가성지수"
+                if name_col is None or pop_col is None:
+                    st.error("선거구명/주민등록인구 열이 필요합니다.")
+                else:
+                    merged = const_df.copy()
+                    merged["__key__"] = merged[name_col].astype(str).map(_norm)
+                    gdf2 = gdf.copy()
+                    gdf2 = gdf2.merge(merged, left_on="__key__", right_on="__key__", how="left")
 
-# ---------- 4. index distribution ----------
-elif selected.startswith('4.'):
-    st.header('총선별 표의 등가성 지수 분포')
-    if has(historical,['총선','연도','SIDO_SGG','주민등록인구']):
-        t=historical.dropna(subset=['총선','연도','SIDO_SGG','주민등록인구']).copy()
-        choices=sorted(t['총선'].astype(str).unique().tolist())
-        election=st.selectbox('총선 시기 선택',choices,key='dist_election')
-        sub=t[t['총선'].astype(str)==election].copy()
-        sub['표의 등가성 지수']=sub['주민등록인구'].mean()/sub['주민등록인구'].replace(0,np.nan)
-        fig=px.histogram(sub,x='표의 등가성 지수',nbins=24,opacity=.85)
-        fig.add_vline(x=1,line_dash='dash',line_color='#d9534f',annotation_text='전국 평균 = 1')
-        fig.update_layout(height=510,margin=dict(l=10,r=10,t=25,b=10))
-        fig.update_xaxes(title='표의 등가성 지수(주민등록인구 기준)')
-        fig.update_yaxes(title='선거구 수')
-        st.plotly_chart(fig,use_container_width=True)
-        a,b,c=st.columns(3)
-        a.metric('선거구 수',f'{len(sub):,}개')
-        b.metric('지수 중앙값',f'{sub["표의 등가성 지수"].median():.3f}')
-        c.metric('지수 표준편차',f'{sub["표의 등가성 지수"].std():.3f}')
-        st.caption('지수 1 초과는 전국 평균보다 인구가 적은 선거구, 1 미만은 평균보다 인구가 많은 선거구를 뜻합니다.')
-    else:
-        notice('실제 분포를 그리려면 `historical_constituencies.csv`에 총선, 연도, SIDO_SGG, 주민등록인구 열과 각 총선의 선거구별 원자료가 필요합니다. 최대·최소·평균만으로는 분포를 복원할 수 없어 임의의 분포값은 만들지 않았습니다.')
+                    vcol = pop_col
+                    values = pd.to_numeric(gdf2[vcol], errors="coerce")
+                    if values.notna().sum() == 0:
+                        vcol = idx_col if idx_col else pop_col
+                        values = pd.to_numeric(gdf2[vcol], errors="coerce")
+                    m = folium.Map(location=[36.2, 127.8], zoom_start=6, tiles="CartoDB positron", control_scale=False)
+                    folium.Choropleth(
+                        geo_data=json.loads(gdf2.to_json()),
+                        data=gdf2,
+                        columns=["__key__", vcol],
+                        key_on="feature.properties.__key__",
+                        fill_color="Blues",
+                        fill_opacity=0.75,
+                        line_opacity=0.7,
+                        nan_fill_color="#efefef",
+                        highlight=True,
+                        legend_name="주민등록인구" if vcol == pop_col else "표의 등가성 지수",
+                    ).add_to(m)
+                    folium.GeoJson(
+                        json.loads(gdf2.to_json()),
+                        style_function=lambda x: {"fillOpacity": 0, "color": "#557799", "weight": 0.7},
+                        tooltip=folium.GeoJsonTooltip(fields=["__label__"], aliases=["선거구:"]),
+                    ).add_to(m)
+                    st_folium(m, height=540, use_container_width=True)
 
-# ---------- 5. period change analysis ----------
-elif selected.startswith('5.'):
-    st.header('총선 시기별 표의 등가성 변화 분석')
-    if has(history,['총선','연도','최대인구','최소인구','평균인구']):
-        t=history.dropna(subset=['연도','최대인구','최소인구','평균인구']).sort_values('연도').copy()
-        t['최대·최소 인구편차 비율']=t['최대인구']/t['최소인구'].replace(0,np.nan)
-        base_ratio=t.iloc[0]['최대·최소 인구편차 비율']
-        t['표의 등가성 상대지수(첫 총선=100)']=base_ratio/t['최대·최소 인구편차 비율']*100
-        t['최대·최소 범위/평균(%)']=(t['최대인구']-t['최소인구'])/t['평균인구']*100
-        fig=go.Figure()
-        fig.add_trace(go.Scatter(x=t['연도'],y=t['표의 등가성 상대지수(첫 총선=100)'],mode='lines+markers',name='표의 등가성 상대지수',
-            customdata=t['총선'],hovertemplate='%{customdata}<br>%{x}년<br>상대지수 %{y:.2f}<extra></extra>'))
-        fig.add_hline(y=100,line_dash='dot',line_color='#999',annotation_text='첫 번째 관측 총선 = 100')
-        fig.update_layout(height=470,margin=dict(l=10,r=10,t=25,b=10),showlegend=False)
-        fig.update_xaxes(title='총선 연도',dtick=4,tickformat='d')
-        fig.update_yaxes(title='상대지수(높을수록 최대·최소 격차가 작음)')
-        st.plotly_chart(fig,use_container_width=True)
-        fig2=px.bar(t,x='총선',y='최대·최소 범위/평균(%)',text_auto='.1f')
-        fig2.update_layout(height=350,margin=dict(l=10,r=10,t=15,b=10),showlegend=False)
-        fig2.update_yaxes(title='(최대 인구 - 최소 인구) ÷ 평균 인구(%)')
-        st.plotly_chart(fig2,use_container_width=True)
-        st.dataframe(t[['총선','연도','최대·최소 인구편차 비율','표의 등가성 상대지수(첫 총선=100)','최대·최소 범위/평균(%)']],use_container_width=True,hide_index=True)
-        st.warning('이 상대지수는 프로젝트에서 정의한 탐색용 지표입니다. 선거구별 전체 인구분포가 아닌 최대·최소·평균 요약값으로 계산하며, 공식 민주주의 지수나 법적 위법 판정 지표가 아닙니다. 첫 관측 총선을 100으로 놓고 최대·최소 인구비율의 상대 변화를 나타냅니다.')
-    else:
-        notice('election_history_summary.csv에 총선별 최대·최소·평균 인구 자료가 필요합니다.')
+    with right:
+        st.markdown("**차트**")
+        if const_df is None or const_df.empty:
+            st.info("선거구별 인구 CSV가 필요합니다. 위 업로드 또는 data/constituency_population.csv를 넣어 주세요.")
+        else:
+            pop_col = pick_col(const_df, ["주민등록인구", "population"])
+            name_col = pick_col(const_df, ["선거구명", "선거구", "district", "name"])
+            idx_col = pick_col(const_df, ["표의등가성지수", "등가성지수", "eqindex"])
+            if pop_col is None or name_col is None:
+                st.error("선거구명/주민등록인구 열이 필요합니다.")
+            else:
+                if idx_col is None:
+                    const_df["표의등가성지수"] = compute_equal_vote_index(const_df)
+                    idx_col = "표의등가성지수"
+                top_n = st.slider("Top N", 5, 20, 10, key="topn2")
+                dff = const_df.copy()
+                dff[pop_col] = pd.to_numeric(dff[pop_col], errors="coerce")
+                dff[idx_col] = pd.to_numeric(dff[idx_col], errors="coerce")
+                dff = dff.dropna(subset=[pop_col, idx_col, name_col])
+                top_pop = dff.nlargest(top_n, pop_col)[[name_col, pop_col]].sort_values(pop_col)
+                top_idx = dff.nlargest(top_n, idx_col)[[name_col, idx_col]].sort_values(idx_col)
 
-# ---------- 6. resident population and electorate ----------
-elif selected.startswith('6.'):
-    st.header('주민등록인구와 유권자수(선거인수)의 관계 분석')
-    if has(voters_dist,['총선','선거구','주민등록인구','선거인수']):
-        t=voters_dist.dropna(subset=['주민등록인구','선거인수']).copy()
-        e=st.selectbox('총선 시기 선택',['전체']+sorted(t['총선'].astype(str).unique().tolist()),key='voters_election')
-        if e!='전체': t=t[t['총선'].astype(str)==e]
-        fig=px.scatter(t,x='주민등록인구',y='선거인수',color='시도' if '시도' in t else None,hover_name='선거구',trendline='ols' if len(t)>=3 else None)
-        fig.update_layout(height=510,margin=dict(l=10,r=10,t=20,b=10))
-        fig.update_xaxes(title='주민등록인구(명)',tickformat=',')
-        fig.update_yaxes(title='선거인수(명)',tickformat=',')
-        st.plotly_chart(fig,use_container_width=True)
-        t['선거인수/주민등록인구(%)']=t['선거인수']/t['주민등록인구']*100
-        st.metric('평균 선거인수 비율',f'{t["선거인수/주민등록인구(%)"].mean():.2f}%')
-        st.caption('선거구별 원자료가 연결된 경우의 분석입니다. 주민등록인구와 선거인수의 기준일이 다를 수 있으므로 기준일을 확인해야 합니다.')
-    elif has(voters_nat,['총선','연도','주민등록인구','선거인수']):
-        t=voters_nat.dropna(subset=['주민등록인구','선거인수']).copy().sort_values('연도')
-        t['선거인수 비율(%)']=t['선거인수']/t['주민등록인구']*100
-        fig=px.scatter(t,x='주민등록인구',y='선거인수',text='총선',hover_data=['연도','선거인수 비율(%)'])
-        fig.update_traces(textposition='top center',marker=dict(size=13,color='#2374c6'))
-        fig.update_layout(height=490,margin=dict(l=10,r=10,t=25,b=10))
-        fig.update_xaxes(title='전국 주민등록인구(명)',tickformat=',')
-        fig.update_yaxes(title='전국 선거인수(명)',tickformat=',')
-        st.plotly_chart(fig,use_container_width=True)
-        fig2=px.line(t,x='연도',y='선거인수 비율(%)',markers=True,text='총선')
-        fig2.update_layout(height=360,margin=dict(l=10,r=10,t=15,b=10))
-        fig2.update_yaxes(title='선거인수 ÷ 주민등록인구(%)')
-        st.plotly_chart(fig2,use_container_width=True)
-        st.dataframe(t[['총선','연도','주민등록인구','선거인수','선거인수 비율(%)']],use_container_width=True,hide_index=True)
-        st.warning('현재 기본 자료는 전국 합계 기준이며 선거구별 관계를 직접 보여주는 자료는 아닙니다. 선거구별 산점도를 보려면 election_voters_district.csv를 연결하세요. 전국 총계 3개 총선만으로 회귀관계를 일반화하지 않습니다.')
-    else:
-        notice('전국 단위 기본자료 또는 선거구별 자료가 없습니다. `election_voters_national.csv` 또는 `election_voters_district.csv`를 연결해 주세요.')
+                fig2 = make_subplots(rows=1, cols=2, subplot_titles=(f"인구수 Top {top_n}", f"등가성 지수 Top {top_n}"))
+                fig2.add_trace(go.Bar(x=top_pop[pop_col], y=top_pop[name_col], orientation="h", name="인구수"), row=1, col=1)
+                fig2.add_trace(go.Bar(x=top_idx[idx_col], y=top_idx[name_col], orientation="h", name="등가성 지수"), row=1, col=2)
+                fig2.update_layout(height=540, margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
+                st.plotly_chart(fig2, use_container_width=True)
 
-# Footer: data caveats and sources
-st.divider()
-st.caption('데이터 해석 원칙: 실제 원자료가 없는 수치는 생성하지 않습니다. 주민등록인구(미성년자 포함), 선거인수, 실제 투표자수는 서로 다른 개념입니다. 표의 등가성 지수는 주민등록인구 기준의 상대적 대표 규모를 나타내는 프로젝트 분석지표입니다.')
-st.markdown('**주요 자료 출처**')
-st.markdown('''
-- 중앙선거관리위원회, 제22대 국회의원선거 총람: https://www.nec.go.kr
-- 행정안전부 주민등록 인구통계: https://jumin.mois.go.kr/
-- 중앙선거관리위원회 선거인수 정보(공공데이터포털): https://www.data.go.kr/data/15094967/openapi.do
-- 제22대 국회의원 선거구 경계 GeoJSON: https://github.com/OhmyNews/2024_22_elec_map (MIT License)
-''')
+# ---------- 3 ----------
+with st.container(border=True):
+    section_header("3", "인접 선거구와의 인구 차이")
+    st.caption("지도만 표시됩니다.")
+    uploaded_const3 = st.file_uploader("인접 비교용 선거구 인구 CSV 업로드", type=["csv"], key="u_const3")
+    const_df3 = load_constituency_data(uploaded_const3)
+    if const_df3 is None or const_df3.empty or geojson is None or gdf is None or gdf.empty:
+        fallback_map(
+            "인접 선거구 인구 차이 지도",
+            "선거구별 인구 CSV와 GeoJSON이 모두 있어야 인접 평균 대비 빨강/파랑/회색 색칠이 가능합니다.",
+            height=620,
+        )
+    else:
+        pop_col = pick_col(const_df3, ["주민등록인구", "population"])
+        name_col = pick_col(const_df3, ["선거구명", "선거구", "district", "name"])
+        if pop_col is None or name_col is None:
+            st.error("선거구명/주민등록인구 열이 필요합니다.")
+        else:
+            d = const_df3.copy()
+            d[name_col] = d[name_col].astype(str)
+            d["__key__"] = d[name_col].map(_norm)
+            d[pop_col] = pd.to_numeric(d[pop_col], errors="coerce")
+            gdf3 = gdf.copy().merge(d, on="__key__", how="left")
+            neighbors = compute_neighbors(gdf3)
+            mean_neighbor = {}
+            for i in gdf3.index:
+                nbrs = list(neighbors.get(i, []))
+                vals = gdf3.loc[nbrs, pop_col].dropna().astype(float) if nbrs else pd.Series(dtype=float)
+                mean_neighbor[i] = float(vals.mean()) if len(vals) else np.nan
+
+            def color_row(i):
+                p = gdf3.at[i, pop_col]
+                n = mean_neighbor.get(i)
+                if pd.isna(p) or pd.isna(n):
+                    return "#d9d9d9"
+                if abs(p - n) < 1e-9:
+                    return "#8c8c8c"
+                return "#d73027" if p > n else "#4575b4"
+
+            m3 = folium.Map(location=[36.2, 127.8], zoom_start=6, tiles="CartoDB positron", control_scale=False)
+            for i, row in gdf3.iterrows():
+                col = color_row(i)
+                pop = row.get(pop_col, np.nan)
+                nbr = mean_neighbor.get(i, np.nan)
+                tooltip = f"{row['__label__']}" if row['__label__'] else ""
+                popup = folium.Popup(
+                    f"<b>{row['__label__']}</b><br>인구: {'' if pd.isna(pop) else f'{int(pop):,}'}<br>"
+                    f"인접 평균: {'' if pd.isna(nbr) else f'{int(nbr):,}'}",
+                    max_width=250,
+                )
+                folium.GeoJson(
+                    row["geometry"],
+                    style_function=lambda feat, c=col: {"fillColor": c, "color": c, "weight": 0.8, "fillOpacity": 0.65},
+                    tooltip=tooltip,
+                    popup=popup,
+                ).add_to(m3)
+            st_folium(m3, height=620, use_container_width=True)
+
+# ---------- 4 ----------
+with st.container(border=True):
+    section_header("4", "총선별 표의 등가성 지수 분포")
+    st.caption("차트만 표시됩니다.")
+    # Prefer constituency-level file if available, otherwise fallback to election summary band.
+    const_path = DATA / "constituency_population.csv"
+    if const_path.exists():
+        const_hist = pd.read_csv(const_path)
+    else:
+        const_hist = None
+
+    if const_hist is not None and not const_hist.empty and "총선" in const_hist.columns and "주민등록인구" in const_hist.columns:
+        const_hist["총선"] = pd.to_numeric(const_hist["총선"], errors="coerce")
+        const_hist["주민등록인구"] = pd.to_numeric(const_hist["주민등록인구"], errors="coerce")
+        const_hist["표의등가성지수"] = const_hist.groupby("총선")["주민등록인구"].transform(lambda s: s.mean() / s)
+        fig4 = go.Figure()
+        for election, grp in const_hist.dropna(subset=["총선","표의등가성지수"]).groupby("총선"):
+            fig4.add_trace(go.Box(y=grp["표의등가성지수"], name=f"{int(election)}대", boxmean=True))
+        fig4.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="표의 등가성 지수")
+        st.plotly_chart(fig4, use_container_width=True)
+    else:
+        st.caption("현재는 총선별 요약값으로 분포 범위를 표시합니다. 선거구별 CSV가 있으면 실제 분포(Box Plot)로 바뀝니다.")
+        fig4 = go.Figure()
+        fig4.add_trace(go.Scatter(
+            x=history["연도"], y=history["최대인구"], mode="lines", line=dict(color="#1f77b4"),
+            name="최대"
+        ))
+        fig4.add_trace(go.Scatter(
+            x=history["연도"], y=history["최소인구"], mode="lines", line=dict(color="#9ecae1"),
+            name="최소", fill="tonexty", fillcolor="rgba(158,202,225,0.25)"
+        ))
+        fig4.add_trace(go.Scatter(
+            x=history["연도"], y=history["평균인구"], mode="lines+markers", line=dict(color="#d62728"),
+            name="평균"
+        ))
+        fig4.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="인구(명)", xaxis_title="총선 연도")
+        fig4.update_yaxes(tickformat=",")
+        st.plotly_chart(fig4, use_container_width=True)
+
+# ---------- 5 ----------
+with st.container(border=True):
+    section_header("5", "주민등록인구와 유권자수(선거인수)의 관계 분석")
+    st.caption("차트만 표시됩니다.")
+    vv = voters.copy()
+    vv["선거인수비율"] = vv["선거인수"] / vv["주민등록인구"] * 100
+    fig5 = go.Figure()
+    fig5.add_trace(go.Scatter(
+        x=vv["주민등록인구"], y=vv["선거인수"], mode="markers+lines+text",
+        text=vv["총선"].astype(str) + "대", textposition="top center",
+        name="관측값"
+    ))
+    if len(vv) >= 2:
+        m, b = np.polyfit(vv["주민등록인구"], vv["선거인수"], 1)
+        xline = np.linspace(vv["주민등록인구"].min(), vv["주민등록인구"].max(), 100)
+        fig5.add_trace(go.Scatter(
+            x=xline, y=m * xline + b, mode="lines", name="추세선", line=dict(dash="dash")
+        ))
+    fig5.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10), xaxis_title="주민등록인구", yaxis_title="선거인수")
+    fig5.update_xaxes(tickformat=",")
+    fig5.update_yaxes(tickformat=",")
+    st.plotly_chart(fig5, use_container_width=True)
+    st.caption("아래 표는 발표용 해석을 돕는 요약값입니다.")
+    st.dataframe(vv[["총선","연도","주민등록인구","선거인수","선거인수비율"]], use_container_width=True, hide_index=True)
