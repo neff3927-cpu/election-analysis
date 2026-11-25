@@ -135,6 +135,14 @@ if election=="제23대 총선 가정":
 elif election=="역대 총선 비교":
     st.caption("역대 총선 비교에서는 선거구별 현재 상세정보 대신 총선별 집계 자료를 사용합니다.")
 
+# 표의 등가성 지수의 기준 평균은 지역/선거구 필터를 적용하기 전 전국 평균으로 고정
+national_source=src.copy()
+if has(national_source,["주민등록인구"]):
+    national_source["주민등록인구"]=pd.to_numeric(national_source["주민등록인구"],errors="coerce")
+    mean_pop=national_source["주민등록인구"].mean()
+else:
+    mean_pop=np.nan
+
 view=src.copy()
 if not view.empty:
     if region!="전체" and "시도" in view: view=view[view["시도"].astype(str)==region]
@@ -142,9 +150,7 @@ if not view.empty:
 if has(view,["주민등록인구"]):
     view=view.copy()
     view["주민등록인구"]=pd.to_numeric(view["주민등록인구"],errors="coerce")
-    mean_pop=view["주민등록인구"].mean()
     view["표의 등가성 지수"]=mean_pop/view["주민등록인구"].replace(0,np.nan)
-else: mean_pop=np.nan
 
 map_options=["선거구별 주민등록인구","표의 등가성 지수","인접 선거구 인구편차"]
 chart_options=[
@@ -159,41 +165,46 @@ with left:
         st.header("지도 영역")
         map_metric=st.selectbox("지도 표시 기준 선택",map_options)
         st.caption("외부 타일 API 키 없이 대한민국 영역을 표시합니다. 선거구별 점 위치는 CSV의 위도·경도 자료가 있을 때만 나타납니다.")
-        # API-key-free geographic base map. This is a locator map, not a fabricated district-boundary map.
-        figmap=go.Figure()
+        # 외부 타일/키 없이 표시. 좌표가 없으면 빈 Plotly 축 대신 명확한 안내를 표시
         if has(view,["위도","경도"]):
             m=view.dropna(subset=["위도","경도"]).copy()
-            if map_metric=="표의 등가성 지수" and "표의 등가성 지수" in m:
-                color=m["표의 등가성 지수"]
-                colorscale="RdYlBu"
-                cbar="표의 등가성 지수"
-            elif map_metric=="선거구별 주민등록인구" and "주민등록인구" in m:
-                color=m["주민등록인구"]
-                colorscale="Blues"
-                cbar="주민등록인구(명)"
+            if not m.empty:
+                if map_metric=="표의 등가성 지수" and "표의 등가성 지수" in m:
+                    color=m["표의 등가성 지수"]; colorscale="RdYlBu"; cbar="표의 등가성 지수"
+                elif map_metric=="선거구별 주민등록인구" and "주민등록인구" in m:
+                    color=m["주민등록인구"]; colorscale="Blues"; cbar="주민등록인구(명)"
+                else:
+                    color=None; colorscale=None; cbar=None
+                hover=[c for c in ["시도","선거구","주민등록인구","선거인수","표의 등가성 지수"] if c in m.columns]
+                figmap=go.Figure(go.Scattergeo(
+                    lon=m["경도"],lat=m["위도"],mode="markers",
+                    text=m["선거구"] if "선거구" in m else None,
+                    customdata=m[hover].to_numpy() if hover else None,
+                    marker=dict(size=9,color=color if color is not None else "#2563eb",
+                                colorscale=colorscale if colorscale else None,showscale=color is not None,
+                                colorbar=dict(title=cbar) if cbar else None,
+                                line=dict(width=0.7,color="white")),
+                    hovertemplate="%{text}<br>위도 %{lat:.3f}, 경도 %{lon:.3f}<extra></extra>"
+                ))
+                figmap.update_geos(
+                    scope="asia",projection_type="mercator",showland=True,landcolor="#edf2f7",
+                    showocean=True,oceancolor="#dcecf4",showlakes=True,lakecolor="#dcecf4",
+                    showcountries=True,countrycolor="#9aa9b8",showcoastlines=True,coastlinecolor="#8ba0b2",
+                    lonaxis_range=[123.5,132.5],lataxis_range=[32.5,39.9],showframe=False,resolution=50
+                )
+                figmap.update_layout(height=610,margin=dict(l=0,r=0,t=5,b=0),paper_bgcolor="white",geo_bgcolor="#dcecf4")
+                st.plotly_chart(figmap,use_container_width=True,config={"displayModeBar":False})
             else:
-                color=None; colorscale=None; cbar=None
-            hover=[c for c in ["시도","선거구","주민등록인구","선거인수","표의 등가성 지수"] if c in m.columns]
-            figmap.add_trace(go.Scattergeo(
-                lon=m["경도"],lat=m["위도"],mode="markers",text=m["선거구"] if "선거구" in m else None,
-                customdata=m[hover].to_numpy() if hover else None,
-                marker=dict(size=9,color=color if color is not None else "#2563eb",colorscale=colorscale if colorscale else None,
-                            showscale=color is not None,colorbar=dict(title=cbar) if cbar else None,
-                            line=dict(width=0.7,color="white")),
-                hovertemplate="%{text}<br>위도 %{lat:.3f}, 경도 %{lon:.3f}<extra></extra>"
-            ))
+                msg("선택한 조건에 해당하는 선거구 좌표가 없습니다. 좌표가 포함된 constituency_population.csv를 연결하면 지도에 표시됩니다.")
         else:
-            st.caption("현재 선거구 좌표 자료가 없어 위치 마커는 표시하지 않습니다.")
-        figmap.update_geos(
-            scope="asia",projection_type="mercator",showland=True,landcolor="#edf2f7",
-            showocean=True,oceancolor="#dcecf4",showlakes=True,lakecolor="#dcecf4",
-            showcountries=True,countrycolor="#9aa9b8",showcoastlines=True,coastlinecolor="#8ba0b2",
-            lonaxis_range=[123.5,132.5],lataxis_range=[32.5,39.9],showframe=False,
-            resolution=50
-        )
-        figmap.update_layout(height=610,margin=dict(l=0,r=0,t=5,b=0),paper_bgcolor="white",geo_bgcolor="#dcecf4")
-        st.plotly_chart(figmap,use_container_width=True,config={"displayModeBar":False})
-        st.caption("지도는 대한민국 위치 확인용 지리 기반도입니다. 선거구 경계 GeoJSON을 확보해 연결하기 전까지 행정구역·선거구 폴리곤을 임의로 그리지 않습니다.")
+            st.markdown("""
+            <div style='height:610px;border:1px dashed #cbd5e1;border-radius:12px;background:linear-gradient(180deg,#f8fafc,#eef4f8);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:28px;'>
+              <div style='font-size:42px'>🗺️</div>
+              <div style='font-size:20px;font-weight:700;margin:10px 0'>선거구 위치 데이터 연결 대기</div>
+              <div style='color:#64748b;max-width:440px;line-height:1.7'>현재 CSV에 선거구별 위도·경도 또는 GeoJSON 경계가 없어 지도 마커를 표시하지 않습니다.<br>공식 좌표·경계 자료를 연결하면 이 영역에 표시됩니다.</div>
+            </div>
+            """,unsafe_allow_html=True)
+        st.caption("지도는 좌표·경계 원자료가 연결된 경우에만 실제 위치를 표시합니다. 자료가 없을 때 임의 위치나 선거구 경계를 만들어 표시하지 않습니다.")
 
 with right:
     with st.container(border=True):
@@ -209,9 +220,17 @@ with right:
                 if not has(history,["연도","최대인구","최소인구"]): return msg("election_history_summary.csv에 연도·최대인구·최소인구가 필요합니다.")
                 t=history.dropna(subset=["연도","최대인구","최소인구"]).copy().sort_values("연도")
                 t["인구편차 비율"]=t["최대인구"]/t["최소인구"].replace(0,np.nan)
-                fig=px.line(t,x="연도",y="인구편차 비율",markers=True,hover_data=[c for c in ["총선","선거구수","인구기준일","출처"] if c in t])
-                fig.add_hline(y=2,line_dash="dash",line_color="#dc6b6b",annotation_text="2:1 참고선")
-                fig.update_yaxes(title="최대 인구 ÷ 최소 인구(배)",tickformat=".2f")
+                t["연도"]=pd.to_numeric(t["연도"],errors="coerce")
+                t=t.dropna(subset=["연도"]).sort_values("연도")
+                fig=px.line(t,x="연도",y="인구편차 비율",markers=True,
+                            hover_data=[c for c in ["총선","최대인구","최소인구","선거구수","인구기준일","출처"] if c in t])
+                # 2:1은 현행 참고선일 뿐, 과거 총선에 소급해 위법 여부를 판정하지 않음
+                fig.add_hline(y=2,line_dash="dash",line_color="#dc6b6b",annotation_text="2:1 현행 기준 참고선")
+                lo=float(t["인구편차 비율"].min()); hi=float(t["인구편차 비율"].max())
+                pad=max((hi-lo)*0.25,0.006)
+                fig.update_yaxes(title="최대 인구 ÷ 최소 인구(배)",tickformat=".3f",
+                                 range=[min(lo- pad,1.90),max(hi+pad,2.06)],dtick=0.02)
+                st.caption("주의: 2:1 선은 현행 기준을 이해하기 위한 참고선이며, 과거 총선 당시의 법적 기준과 다를 수 있어 소급 판정에 사용하지 않습니다.")
             elif choice=="역대 최대·최소·평균 인구 변화":
                 if not has(history,["연도","최대인구","최소인구","평균인구"]): return msg("election_history_summary.csv에 총선별 최대·최소·평균 인구가 필요합니다.")
                 t=history.dropna(subset=["연도","최대인구","최소인구","평균인구"]).sort_values("연도")
@@ -239,7 +258,7 @@ with right:
                 if not has(view,["선거구","주민등록인구"]):return msg("선거구별 주민등록인구 자료가 있어야 지수를 계산할 수 있습니다.")
                 t=view.dropna(subset=["주민등록인구"]).copy()
                 if t.empty:return msg("유효한 인구 자료가 없습니다.")
-                t["지수"]=t["주민등록인구"].mean()/t["주민등록인구"].replace(0,np.nan)
+                t["지수"]=mean_pop/t["주민등록인구"].replace(0,np.nan)
                 fig=px.histogram(t,x="지수",nbins=20)
                 fig.add_vline(x=1,line_dash="dash",line_color="#dc6b6b",annotation_text="전국 평균=1")
                 fig.update_xaxes(title="표의 등가성 지수(주민등록인구 기준)")
