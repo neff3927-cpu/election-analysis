@@ -33,10 +33,17 @@ from urllib.parse import unquote
 
 API_URL = "https://apis.data.go.kr/9760000/ElcntInfoInqireService/getElpcElcntInfoInqire"
 ELECTIONS = {"제20대": "20160413", "제21대": "20200415", "제22대": "20240410"}
-SIDO_NAMES = [
+SIDO_NAMES_OLD = [
     "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시",
     "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원도",
     "충청북도", "충청남도", "전라북도", "전라남도", "경상북도",
+    "경상남도", "제주특별자치도"
+]
+# 제22대 당시 강원특별자치도·전북특별자치도 명칭 사용
+SIDO_NAMES_2024 = [
+    "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시",
+    "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원특별자치도",
+    "충청북도", "충청남도", "전북특별자치도", "전라남도", "경상북도",
     "경상남도", "제주특별자치도"
 ]
 
@@ -132,7 +139,10 @@ with st.expander("중앙선관위 API 연결 및 선거구별 유권자 원자�
             except Exception as exc: st.error(f"{label} 테스트 실패: {exc}")
     if collect_clicked and key:
         collected=[]; errors=[]
-        tasks=[(label,eid,sido) for label,eid in ELECTIONS.items() for sido in SIDO_NAMES]
+        tasks=[]
+    for label,eid in ELECTIONS.items():
+        sido_list = SIDO_NAMES_2024 if label == "제22대" else SIDO_NAMES_OLD
+        tasks.extend((label,eid,sido) for sido in sido_list)
         progress=st.progress(0)
         for i,(label,eid,sido) in enumerate(tasks,1):
             try:
