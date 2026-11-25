@@ -1,34 +1,15 @@
 # 국회의원 지역구 인구와 표의 등가성 분석
 
-실행:
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+## Streamlit Cloud 배포 시 필수
+이 프로젝트는 지도 표시를 위해 `folium`과 `streamlit-folium`을 사용합니다.
+따라서 `app.py`만 업로드하면 `ModuleNotFoundError: No module named 'folium'` 오류가 발생합니다.
 
-이 버전은 첫 화면에서 옵션 선택 없이 1~5번 분석이 모두 보이도록 구성했습니다.
+GitHub 저장소 최상위(루트)에 아래 항목을 함께 업로드하세요.
+- `app.py`
+- `requirements.txt`
+- `data/` 폴더 전체
 
-- 1: 역대 총선별 선거구 최대·최소·평균 인구 변화
-- 2: 선거구별 인구수 및 표의 등가성 지수
-- 3: 인접 선거구와의 인구 차이
-- 4: 총선별 표의 등가성 지수 분포
-- 5: 주민등록인구와 유권자수(선거인수)의 관계 분석
+`requirements.txt`가 루트에 있어야 Streamlit Cloud가 필요한 패키지를 설치합니다.
 
-## 입력 파일 안내
-- `data/election_history_summary.csv` : 역대 총선 요약
-- `data/election_voter_summary.csv` : 주민등록인구/선거인수 요약
-- `data/constituency_population_template.csv` : 선거구별 인구 데이터 템플릿
-
-2번과 3번을 실제 색상 지도와 top 10 차트로 보려면,
-`data/constituency_population.csv`를 추가하세요. 필요한 열은 아래와 같습니다.
-
-- 총선
-- 선거구명
-- 시도
-- 주민등록인구
-- 선거인수
-- 표의등가성지수
-- 위도
-- 경도
-
-GeoJSON 경계는 실행 시 공개 저장소에서 불러옵니다.
+## 배포 후
+Streamlit Cloud에서 앱을 재부팅하거나 Reboot app을 실행하세요.
