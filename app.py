@@ -50,9 +50,10 @@ def load_geo():
 
 def get_key(feature):
     p=feature.get("properties",{})
-    for k in ("SIDO_SGG","SIDO_SGG_NM","SGG","SIGUNGU"):
+    # GeoJSON의 공식 선거구 고유코드로 결합해 한글 명칭/띄어쓰기 불일치를 방지
+    for k in ("SGG_Code","SIDO_SGG","SIDO_SGG_NM","SGG","SIGUNGU"):
         if p.get(k) not in (None,""):
-            return str(p[k])
+            return str(p[k]).strip()
     return None
 
 def get_region(feature):
@@ -86,26 +87,35 @@ def estimated_population(geo):
         vals=np.clip(vals,low,high)
     rows=[]
     for i,(f,v) in enumerate(zip(feats,vals)):
-        rows.append({"SIDO_SGG":get_key(f),"시도":get_region(f),"주민등록인구_모형추정":float(v)})
+        rows.append({"SGG_Code":get_key(f),"선거구":str(f.get("properties",{}).get("SIDO_SGG",get_key(f))),
+                     "시도":get_region(f),"주민등록인구_모형추정":float(v)})
     return pd.DataFrame(rows)
 
 def map_figure(geo, table, value_col, title, colors="Blues", categorical=False):
-    locs=table["SIDO_SGG"].astype(str).tolist()
+    # GeoJSON의 properties.SGG_Code(선거구 고유코드)를 기준으로 지도와 데이터를 결합
+    locs=table["SGG_Code"].astype(str).tolist()
     z=table[value_col].astype(float).tolist()
+    if not locs:
+        raise ValueError("지도에 표시할 선거구 데이터가 없습니다.")
     if categorical:
         scale=[[0,"#3478c8"],[0.499,"#3478c8"],[0.5,"#a3a3a3"],[0.501,"#c94b4b"],[1,"#c94b4b"]]
         cbar=dict(title="인접 평균 대비",tickvals=[-1,0,1],ticktext=["낮음","같음","높음"])
         zmin,zmax=-1,1
     else:
-        scale=colors;cbar=dict(title=title);zmin=zmax=None
+        scale=colors
+        cbar=dict(title=title)
+        zmin=zmax=None
+    labels=table["선거구"].astype(str).tolist() if "선거구" in table else locs
+    regions=table["시도"].astype(str).tolist()
     fig=go.Figure(go.Choropleth(
-        geojson=geo,featureidkey="properties.SIDO_SGG",locations=locs,z=z,
-        colorscale=scale,zmin=zmin,zmax=zmax,marker_line_color="#ffffff",marker_line_width=.55,
-        colorbar=cbar,customdata=np.column_stack([table["시도"].astype(str).to_numpy(), (table["선거구"].astype(str).to_numpy() if "선거구" in table.columns else np.repeat("", len(table)))]),
-        hovertemplate="%{customdata[0]}<br>%{location}<br>"+title+": %{z:,.3f}<extra></extra>"
+        geojson=geo, featureidkey="properties.SGG_Code", locations=locs, z=z,
+        colorscale=scale, zmin=zmin, zmax=zmax,
+        marker_line_color="#ffffff", marker_line_width=0.65,
+        colorbar=cbar, customdata=np.column_stack([regions,labels]),
+        hovertemplate="%{customdata[0]} · %{customdata[1]}<br>"+title+": %{z:,.3f}<extra></extra>"
     ))
-    fig.update_geos(fitbounds="locations",visible=False,projection_type="mercator")
-    fig.update_layout(height=650,margin=dict(l=0,r=0,t=10,b=0),paper_bgcolor="white",geo_bgcolor="white")
+    fig.update_geos(fitbounds="locations",visible=False,projection_type="mercator",bgcolor="rgba(0,0,0,0)")
+    fig.update_layout(height=650,margin=dict(l=0,r=10,t=10,b=0),paper_bgcolor="white",geo_bgcolor="white")
     return fig
 
 # 1. Historical max / min / average
@@ -134,6 +144,10 @@ st.warning("선거구별 인구 원자료와 경계의 완전한 결합표는 �
 try:
     geo=load_geo()
     district=estimated_population(geo)
+    geo_codes={str(f.get("properties",{}).get("SGG_Code"," ")).strip() for f in geo["features"]}
+    matched=len(set(district["SGG_Code"].astype(str)) & geo_codes)
+    if matched < 200:
+        raise ValueError(f"선거구 코드 결합이 충분하지 않습니다. 일치 {matched}개")
     district["표의 등가성 지수"]=district["주민등록인구_모형추정"].mean()/district["주민등록인구_모형추정"]
     a,b,c=st.columns([1,1,1])
     with a: map_metric=st.selectbox("지도 색상 기준",["모형 추정 인구","표의 등가성 지수"],key="map_metric")
@@ -150,7 +164,7 @@ try:
         st.markdown(f"**{rank_metric} Top 10 · 모형 추정**")
         rcol="주민등록인구_모형추정" if rank_metric=="모형 추정 인구" else "표의 등가성 지수"
         top=view.nlargest(10,rcol).sort_values(rcol)
-        bar=px.bar(top,x=rcol,y="SIDO_SGG",orientation="h",color="시도",hover_data=["주민등록인구_모형추정","표의 등가성 지수"])
+        bar=px.bar(top,x=rcol,y="선거구",orientation="h",color="시도",hover_data=["주민등록인구_모형추정","표의 등가성 지수"])
         bar.update_layout(height=560,margin=dict(l=5,r=5,t=10,b=5),legend_title_text="")
         st.plotly_chart(bar,use_container_width=True)
         st.metric("지도에 표시된 선거구",f"{len(view):,}개")
@@ -166,7 +180,7 @@ try:
     from shapely.geometry import shape
     feats=[f for f in geo["features"] if get_key(f)]
     geoms={get_key(f):shape(f["geometry"]) for f in feats}
-    pop=district.set_index("SIDO_SGG")["주민등록인구_모형추정"].to_dict()
+    pop=district.set_index("SGG_Code")["주민등록인구_모형추정"].to_dict()
     neighbors={k:[] for k in geoms}
     keys=list(geoms)
     for i,ka in enumerate(keys):
@@ -183,7 +197,7 @@ try:
         if not vals or k not in pop: continue
         avg=float(np.mean(vals)); diff=pop[k]-avg
         state=0 if abs(diff)<=tol else (1 if diff>0 else -1)
-        adjrows.append({"SIDO_SGG":k,"시도":district.set_index("SIDO_SGG").loc[k,"시도"],"인접평균":avg,"차이":diff,"차이율(%)":diff/avg*100,"상태":state})
+        adjrows.append({"SGG_Code":k,"시도":district.set_index("SGG_Code").loc[k,"시도"],"인접평균":avg,"차이":diff,"차이율(%)":diff/avg*100,"상태":state})
     adj=pd.DataFrame(adjrows)
     adj_region=st.selectbox("지역 필터",["전체"]+sorted(adj["시도"].dropna().unique().tolist()),key="adj_region")
     if adj_region!="전체": adj=adj[adj["시도"]==adj_region]
@@ -225,24 +239,36 @@ fig.update_xaxes(title="표의 등가성 지수")
 fig.update_yaxes(title="모형상 선거구 수")
 st.plotly_chart(fig,use_container_width=True)
 
-# 5. Population vs registered voters
+# 5. Population vs registered voters (22nd election, constituency level)
 st.divider()
-st.header("5. 주민등록인구와 유권자수(선거인수)의 관계 분석")
-st.caption("전국 합계 기준 비교입니다. 주민등록인구와 선거인수는 기준일·집계 개념이 다르며, 선거인수는 투표자 수와 다릅니다.")
-v=voters.copy()
-v["선거인수 비율(%)"]=v["선거인수"]/v["전국주민등록인구"]*100
-fig=px.scatter(v,x="전국주민등록인구",y="선거인수",text="총선",size="선거인수 비율(%)",color="연도",
-               hover_data={"연도":True,"선거인수 비율(%)":":.2f","전국주민등록인구":":,","선거인수":":,"})
-fig.update_traces(textposition="top center")
-fig.update_layout(height=500,margin=dict(l=10,r=10,t=20,b=10),showlegend=False)
-fig.update_xaxes(title="전국 주민등록인구(명)",tickformat=",")
-fig.update_yaxes(title="전국 선거인수(명)",tickformat=",")
-st.plotly_chart(fig,use_container_width=True)
+st.header("5. 제22대 총선 선거구 인구수와 선거인수 비율의 관계")
+st.caption("각 점은 하나의 국회의원 지역구입니다. x축은 선거구 인구수, y축은 선거구 인구수 대비 확정 선거인수 비율입니다.")
+scatter_path=DATA/"election22_district_population_voters.csv"
+if scatter_path.exists():
+    s22=pd.read_csv(scatter_path)
+    fig=px.scatter(
+        s22, x="선거구인구수", y="선거인수비율(%)", hover_name="선거구명",
+        hover_data={"선거구인구수":":,","확정선거인수":":,","선거인수비율(%)":":.2f"},
+        color="sdName",
+        labels={"선거구인구수":"선거구 인구수(명)","선거인수비율(%)":"선거인수 비율(%)","sdName":"시도"},
+        opacity=.78
+    )
+    fig.update_traces(marker=dict(size=9,line=dict(width=.5,color="white")))
+    fig.update_layout(height=540,margin=dict(l=10,r=10,t=20,b=10),legend_title_text="시도",hovermode="closest")
+    fig.update_xaxes(title="선거구 인구수(명)",tickformat=",")
+    fig.update_yaxes(title="선거구 인구수 대비 선거인수 비율(%)",ticksuffix="%")
+    st.plotly_chart(fig,use_container_width=True)
+    st.metric("산점도에 포함된 선거구",f"{len(s22):,}개")
+    st.caption("비율 = 확정 선거인수 ÷ 선거구 인구수 × 100. 선거인수는 투표에 참여한 사람 수가 아니라 선거인명부에 등재된 유권자 수입니다.")
+    st.warning(f"현재 확보한 중앙선거관리위원회 API 자료에서 선거구 단위로 확인되는 제22대 자료 {len(s22)}개만 표시했습니다. 전체 254개 선거구 중 누락된 지역이 있어 전국 전체를 대표하는 완전한 산점도는 아닙니다.")
+else:
+    st.error("제22대 선거구별 인구·선거인수 자료 파일을 찾을 수 없습니다.")
 
 st.divider()
 st.subheader("자료 및 해석상 유의사항")
 st.markdown("""
 - **실제 통계:** 제20·21·22대 총선별 전국 인구, 선거구 수, 최대·최소 인구 및 전국 선거인수 요약
+- **제22대 산점도:** 중앙선거관리위원회 API에서 확인된 225개 선거구의 선거구 인구(ppltCnt)와 확정 선거인수(cfmtnElcnt)를 사용
 - **읍면동 자료:** KOSIS 「행정구역(읍면동)별/5세별 주민등록인구」에서 각 총선 인구 기준월의 읍면동별 총인구를 추출해 부록 데이터로 포함
 - **모형 추정:** 선거구별 지도, Top 10, 인접 선거구 비교 및 분포는 선거구별 공식 인구 원자료와 경계의 완전한 결합표가 없어 시각화 시연용으로 생성
 - 표의 등가성 지수는 주민등록인구 기준의 상대적 대표 규모를 나타내는 프로젝트 분석지표이며, 실제 개인의 투표권 행사나 법적 위헌 여부를 직접 측정하지 않습니다.
