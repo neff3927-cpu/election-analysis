@@ -1,5 +1,7 @@
-streamlit>=1.40,<2.0
+streamlit>=1.38
 pandas>=2.0
-numpy>=1.26
+numpy>=1.24
 plotly>=5.20
+requests>=2.31
+shapely>=2.0
 statsmodels>=0.14
