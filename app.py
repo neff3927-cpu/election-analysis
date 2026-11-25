@@ -234,26 +234,34 @@ def map_figure(geo, table, value_col, title, colors="Blues", categorical=False):
 # 1. Historical max / min / average
 st.divider()
 st.header("1. 역대 총선별 선거구 최대·최소·평균 인구 변화")
-st.caption("전국 주민등록인구와 선거구 수로 평균을 산출했습니다. 최대·최소값은 선거구 인구 통계에 제시된 값입니다.")
+st.caption("총선별 인구 기준월의 전국 주민등록인구와 선거구 수로 평균을 산출했습니다. 최대·최소값은 해당 총선의 선거구 인구 통계에 제시된 값입니다.")
 metric=st.radio("표시할 인구 통계",["최대·평균·최소 모두","평균 인구 중심"],horizontal=True,key="hist_view")
-h=history.sort_values("연도")
+h=history.sort_values("연도").copy()
+h["총선표시"]=h["총선"]+" ("+h["연도"].astype(str)+")"
 fig=go.Figure()
 if metric=="최대·평균·최소 모두":
     for col,label in [("최대인구","최대 인구"),("평균인구","평균 인구"),("최소인구","최소 인구")]:
-        fig.add_trace(go.Scatter(x=h["연도"],y=h[col],mode="lines+markers",name=label,
-                                 customdata=h["총선"],hovertemplate="%{customdata}<br>%{x}년<br>%{y:,.0f}명<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=h["총선표시"],y=h[col],mode="lines+markers",name=label,
+            customdata=np.column_stack([h["인구기준월"],h["연도"]]),
+            hovertemplate="%{x}<br>인구 기준월: %{customdata[0]}<br>%{y:,.0f}명<extra></extra>"
+        ))
 else:
-    fig.add_trace(go.Bar(x=h["총선"],y=h["평균인구"],name="평균 인구",text=h["평균인구"].round().map(fmt),textposition="outside"))
+    fig.add_trace(go.Bar(
+        x=h["총선표시"],y=h["평균인구"],name="평균 인구",
+        text=h["평균인구"].round().map(fmt),textposition="outside"
+    ))
 fig.update_layout(height=430,hovermode="x unified",legend_title_text="",margin=dict(l=10,r=10,t=20,b=10))
-fig.update_xaxes(title="총선 연도")
+fig.update_xaxes(title="총선 시기",type="category")
 fig.update_yaxes(title="선거구 인구(명)",tickformat=",")
 st.plotly_chart(fig,use_container_width=True)
+st.caption("각 점은 실제 자료가 확인되는 세 차례 총선만 나타냅니다. 점 사이의 선은 관측되지 않은 연도별 변화를 의미하지 않습니다.")
 st.dataframe(h[["총선","인구기준월","선거구수","최대인구","평균인구","최소인구"]].rename(columns={"인구기준월":"주민등록인구 기준월"}),use_container_width=True,hide_index=True)
 
-# 2. Map and top 10
+# 2. Constituency map and official summary
 st.divider()
 st.header("2. 선거구별 인구수 및 표의 등가성 지수")
-st.warning("선거구별 인구 원자료와 경계의 완전한 결합표는 확보되지 않았습니다. 아래 지도와 Top 10은 공식 전국 평균·최대·최소 범위를 반영해 생성한 **시각화용 모형 추정치**입니다. 실제 선거구별 순위나 인구로 인용하면 안 됩니다.")
+st.warning("선거구별 인구 원자료와 경계의 완전한 결합표는 확보되지 않았습니다. 지도는 공식 전국 평균·최대·최소 범위를 반영해 생성한 **시각화용 모형 추정치**입니다. 실제 선거구별 인구로 인용하면 안 됩니다. 오른쪽 그래프는 공식 전국 요약 통계입니다.")
 try:
     geo=load_geo()
     district=estimated_population(geo)
@@ -264,7 +272,7 @@ try:
     district["표의 등가성 지수"]=district["주민등록인구_모형추정"].mean()/district["주민등록인구_모형추정"]
     a,b,c=st.columns([1,1,1])
     with a: map_metric=st.selectbox("지도 색상 기준",["모형 추정 인구","표의 등가성 지수"],key="map_metric")
-    with b: rank_metric=st.selectbox("Top 10 기준",["모형 추정 인구","표의 등가성 지수"],key="rank_metric")
+    with b: st.markdown("**오른쪽 그래프: 공식 전국 요약 통계**")
     with c: region=st.selectbox("지역 필터",["전체"]+sorted(district["시도"].dropna().unique().tolist()),key="map_region")
     view=district.copy()
     if region!="전체": view=view[view["시도"]==region]
@@ -275,13 +283,25 @@ try:
         folium_map = map_figure(geo,view,value_col,map_metric)
         st.components.v1.html(folium_map.get_root().render(),height=680,scrolling=False)
     with right:
-        st.markdown(f"**{rank_metric} Top 10 · 모형 추정**")
-        rcol="주민등록인구_모형추정" if rank_metric=="모형 추정 인구" else "표의 등가성 지수"
-        top=view.nlargest(10,rcol).sort_values(rcol)
-        bar=px.bar(top,x=rcol,y="선거구",orientation="h",color="시도",hover_data=["주민등록인구_모형추정","표의 등가성 지수"])
-        bar.update_layout(height=560,margin=dict(l=5,r=5,t=10,b=5),legend_title_text="")
-        st.plotly_chart(bar,use_container_width=True)
+        st.markdown("**제22대 공식 전국 요약 통계**")
+        summary_row=history.loc[history["연도"]==2024].iloc[0]
+        summary=pd.DataFrame({
+            "통계":["최대 인구","전국 평균 인구","최소 인구"],
+            "인구수":[summary_row["최대인구"],summary_row["평균인구"],summary_row["최소인구"]]
+        })
+        summary_fig=px.bar(
+            summary.sort_values("인구수"),
+            x="인구수",y="통계",orientation="h",
+            text=summary.sort_values("인구수")["인구수"].round().map(fmt),
+            color="통계",
+            color_discrete_map={"최대 인구":"#2463a6","전국 평균 인구":"#79b9e8","최소 인구":"#d97970"}
+        )
+        summary_fig.update_traces(textposition="outside",cliponaxis=False)
+        summary_fig.update_layout(height=430,margin=dict(l=5,r=35,t=15,b=10),showlegend=False,xaxis_title="인구(명)",yaxis_title="")
+        summary_fig.update_xaxes(tickformat=",")
+        st.plotly_chart(summary_fig,use_container_width=True)
         st.metric("지도에 표시된 선거구",f"{len(view):,}개")
+        st.caption(f"공식 요약 통계의 인구 기준월: {summary_row['인구기준월']}. 지도는 모형 추정값이며 오른쪽 그래프는 공식 최대·평균·최소값입니다.")
 except Exception as e:
     st.error(f"선거구 경계 자료를 불러오지 못했습니다: {e}")
     st.info("인터넷 연결이 가능한 Streamlit 실행 환경에서 GeoJSON을 자동으로 불러옵니다.")
@@ -363,7 +383,7 @@ ratio_table=pd.DataFrame({
     "선거구 수":[above,below,equal],
 })
 ratio_table["비율(%)"]=ratio_table["선거구 수"]/len(idx)*100
-st.markdown("**표의 등가성 지수 1 초과·미만 선거구 비율**")
+st.markdown("**모형 추정 기준 표의 등가성 지수 1 초과·미만 선거구 비율**")
 ratio_fig=px.bar(
     ratio_table[ratio_table["선거구 수"]>0],
     x="구분",y="비율(%)",text=ratio_table.loc[ratio_table["선거구 수"]>0,"비율(%)"].map(lambda v:f"{v:.1f}%"),
@@ -411,7 +431,7 @@ if scatter_path.exists():
     c3.metric("설명력 R²",f"{reg.rvalue**2:.3f}")
     slope_10k=reg.slope*10000
     direction="음(-)의 관계" if reg.slope<0 else "양(+)의 관계"
-    st.markdown("**AI 분석 코멘트**")
+    st.markdown("**회귀분석 결과 해석**")
     st.info(
         f"현재 확보된 {len(s22)}개 선거구 자료의 단순선형회귀 결과, 인구수와 선거인수 비율은 {direction}를 보입니다. "
         f"선거구 인구가 1만 명 증가할 때 선거인수 비율은 평균적으로 약 {abs(slope_10k):.2f}%p "
@@ -420,7 +440,11 @@ if scatter_path.exists():
         "다만 이는 상관관계이며, 연령구조·외국인 인구·인구 기준일 차이 등 다른 요인을 통제하지 않은 결과이므로 인과관계로 해석해서는 안 됩니다."
     )
     st.caption("비율 = 확정 선거인수 ÷ 선거구 인구수 × 100. 선거인수는 투표에 참여한 사람이 아니라 선거인명부에 등재된 유권자 수입니다.")
-    st.warning(f"현재 확보한 중앙선거관리위원회 API 자료에서 선거구 단위로 확인되는 제22대 자료 {len(s22)}개만 표시했습니다. 전체 254개 선거구 중 누락된 지역이 있어 전국 전체를 대표하는 완전한 산점도는 아닙니다.")
+    st.warning(
+        f"전체 254개 선거구 중 자료가 확인된 {len(s22)}개만 분석했으며, 29개 선거구는 누락되어 있습니다. "
+        "또한 선거구 인구 기준월과 선거인명부 작성 기준일은 동일한 개념이 아닐 수 있으므로, "
+        "비율 차이를 연령구조만의 영향으로 단정할 수 없습니다."
+    )
 else:
     st.error("제22대 선거구별 인구·선거인수 자료 파일을 찾을 수 없습니다.")
 
