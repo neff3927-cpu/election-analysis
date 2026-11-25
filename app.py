@@ -107,15 +107,43 @@ def map_figure(geo, table, value_col, title, colors="Blues", categorical=False):
         zmin=zmax=None
     labels=table["선거구"].astype(str).tolist() if "선거구" in table else locs
     regions=table["시도"].astype(str).tolist()
+    # Pass only the selected constituency features to Plotly; this prevents the full-country
+    # geometry/ocean canvas from being painted as one solid block when a region filter is active.
+    selected=set(locs)
+    geo_subset={"type":"FeatureCollection","features":[
+        f for f in geo.get("features",[])
+        if str(f.get("properties",{}).get("SGG_Code","")).strip() in selected
+    ]}
+    if not geo_subset["features"]:
+        raise ValueError("선택한 지역의 선거구 코드와 지도 경계가 일치하지 않습니다.")
     fig=go.Figure(go.Choropleth(
-        geojson=geo, featureidkey="properties.SGG_Code", locations=locs, z=z,
+        geojson=geo_subset, featureidkey="properties.SGG_Code", locations=locs, z=z,
         colorscale=scale, zmin=zmin, zmax=zmax,
         marker_line_color="#ffffff", marker_line_width=0.65,
         colorbar=cbar, customdata=np.column_stack([regions,labels]),
         hovertemplate="%{customdata[0]} · %{customdata[1]}<br>"+title+": %{z:,.3f}<extra></extra>"
     ))
-    fig.update_geos(fitbounds="locations",visible=False,projection_type="mercator",bgcolor="rgba(0,0,0,0)")
-    fig.update_layout(height=650,margin=dict(l=0,r=10,t=10,b=0),paper_bgcolor="white",geo_bgcolor="white")
+    fig.update_geos(
+        fitbounds="locations",
+        visible=False,
+        projection_type="mercator",
+        bgcolor="white",
+        showland=True,
+        landcolor="#f7f8fa",
+        showocean=False,
+        showlakes=False,
+        showcountries=False,
+        showcoastlines=False,
+        showframe=False,
+        showrivers=False
+    )
+    fig.update_layout(
+        height=650,
+        margin=dict(l=0,r=10,t=10,b=0),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        geo_bgcolor="white"
+    )
     return fig
 
 # 1. Historical max / min / average
@@ -253,13 +281,36 @@ if scatter_path.exists():
         labels={"선거구인구수":"선거구 인구수(명)","선거인수비율(%)":"선거인수 비율(%)","sdName":"시도"},
         opacity=.78
     )
-    fig.update_traces(marker=dict(size=9,line=dict(width=.5,color="white")))
-    fig.update_layout(height=540,margin=dict(l=10,r=10,t=20,b=10),legend_title_text="시도",hovermode="closest")
+    from scipy import stats
+    x=s22["선거구인구수"].astype(float).to_numpy()
+    y=s22["선거인수비율(%)"].astype(float).to_numpy()
+    reg=stats.linregress(x,y)
+    xline=np.linspace(x.min(),x.max(),100)
+    fig.add_trace(go.Scatter(
+        x=xline, y=reg.intercept+reg.slope*xline, mode="lines",
+        name="선형 회귀선", line=dict(color="#222222",width=2,dash="dash"),
+        hoverinfo="skip"
+    ))
+    fig.update_traces(marker=dict(size=9,line=dict(width=.5,color="white")),selector=dict(mode="markers"))
+    fig.update_layout(height=540,margin=dict(l=10,r=10,t=20,b=10),legend_title_text="시도 / 추세선",hovermode="closest")
     fig.update_xaxes(title="선거구 인구수(명)",tickformat=",")
     fig.update_yaxes(title="선거구 인구수 대비 선거인수 비율(%)",ticksuffix="%")
     st.plotly_chart(fig,use_container_width=True)
-    st.metric("산점도에 포함된 선거구",f"{len(s22):,}개")
-    st.caption("비율 = 확정 선거인수 ÷ 선거구 인구수 × 100. 선거인수는 투표에 참여한 사람 수가 아니라 선거인명부에 등재된 유권자 수입니다.")
+    c1,c2,c3=st.columns(3)
+    c1.metric("분석 선거구",f"{len(s22):,}개")
+    c2.metric("상관계수 r",f"{reg.rvalue:.3f}")
+    c3.metric("설명력 R²",f"{reg.rvalue**2:.3f}")
+    slope_10k=reg.slope*10000
+    direction="음(-)의 관계" if reg.slope<0 else "양(+)의 관계"
+    st.markdown("**AI 분석 코멘트**")
+    st.info(
+        f"현재 확보된 {len(s22)}개 선거구 자료의 단순선형회귀 결과, 인구수와 선거인수 비율은 {direction}를 보입니다. "
+        f"선거구 인구가 1만 명 증가할 때 선거인수 비율은 평균적으로 약 {abs(slope_10k):.2f}%p "
+        f"{'낮아지는' if reg.slope<0 else '높아지는'} 경향이 관찰됩니다(r={reg.rvalue:.3f}, R²={reg.rvalue**2:.3f}, p={reg.pvalue:.3g}). "
+        "즉, 이 표본에서는 인구가 큰 선거구일수록 전체 인구 중 선거인명부에 포함된 사람의 비율이 낮은 경향이 있습니다. "
+        "다만 이는 상관관계이며, 연령구조·외국인 인구·인구 기준일 차이 등 다른 요인을 통제하지 않은 결과이므로 인과관계로 해석해서는 안 됩니다."
+    )
+    st.caption("비율 = 확정 선거인수 ÷ 선거구 인구수 × 100. 선거인수는 투표에 참여한 사람이 아니라 선거인명부에 등재된 유권자 수입니다.")
     st.warning(f"현재 확보한 중앙선거관리위원회 API 자료에서 선거구 단위로 확인되는 제22대 자료 {len(s22)}개만 표시했습니다. 전체 254개 선거구 중 누락된 지역이 있어 전국 전체를 대표하는 완전한 산점도는 아닙니다.")
 else:
     st.error("제22대 선거구별 인구·선거인수 자료 파일을 찾을 수 없습니다.")
