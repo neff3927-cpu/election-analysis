@@ -57,7 +57,11 @@ def parse_nec_response(response):
             payload = {child.tag: child.text for child in root_xml}
         except Exception:
             raise RuntimeError(f"응답 해석 실패. HTTP {response.status_code}, 본문={text_body[:700]}")
-    root = payload.get("getElpcElcntInfoInqire", payload) if isinstance(payload, dict) else {}
+    # NEC API JSON 실제 응답은 {"response":{"header":...,"body":...}} wrapper 구조임.
+    # wrapper를 먼저 해제해야 body.items.item 배열을 읽을 수 있음.
+    root = payload.get("response", payload) if isinstance(payload, dict) else {}
+    if isinstance(root, dict) and "getElpcElcntInfoInqire" in root:
+        root = root["getElpcElcntInfoInqire"]
     header = root.get("header", {}) if isinstance(root, dict) else {}
     body = root.get("body", {}) if isinstance(root, dict) else {}
     code = str(header.get("resultCode", "")) if isinstance(header, dict) else ""
@@ -115,8 +119,11 @@ with st.expander("중앙선관위 API 연결 및 선거구별 유권자 원자�
             try:
                 items, total, payload, response = call_district_electors(eid, key, "서울특별시")
                 st.success(f"{label}: 서울특별시 {len(items)}건 수신 (HTTP {response.status_code})")
-                if items: st.dataframe(pd.DataFrame(items), use_container_width=True)
-                else: st.warning(f"{label}: 0건. API 응답: {json.dumps(payload, ensure_ascii=False)[:1200]}")
+                if items:
+                    st.dataframe(pd.DataFrame(items), use_container_width=True)
+                    st.caption("API 응답 원자료입니다. 합계 행과 실제 지역구 행을 구분해 CSV로 정리합니다.")
+                else:
+                    st.warning(f"{label}: 0건. API 응답: {json.dumps(payload, ensure_ascii=False)[:1200]}")
             except Exception as exc: st.error(f"{label} 테스트 실패: {exc}")
     if collect_clicked and key:
         collected=[]; errors=[]
