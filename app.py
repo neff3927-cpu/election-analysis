@@ -66,13 +66,18 @@ def parse_nec_response(response):
     body = root.get("body", {}) if isinstance(root, dict) else {}
     code = str(header.get("resultCode", "")) if isinstance(header, dict) else ""
     msg = str(header.get("resultMsg", "")) if isinstance(header, dict) else ""
-    if code and code not in ("00", "0", "INFO-000"):
-        raise RuntimeError(f"API 오류 {code}: {msg}; 응답={text_body[:500]}")
+    # 공공데이터포털의 정상 응답은 INFO-000 / NORMAL SERVICE.
+    # 일부 응답에서는 코드 표기가 INFO-00 등으로 축약되어 올 수 있으므로
+    # resultMsg가 NORMAL SERVICE이면 정상으로 처리한다.
+    is_normal = (msg.strip().upper() == "NORMAL SERVICE") or code in ("00", "0", "INFO-000") or code.startswith("INFO-0")
+    if code and not is_normal:
+        raise RuntimeError(f"API 오류 {code}: {msg}; 응답={text_body[:700]}")
     items = []
     if isinstance(body, dict):
         wrapped = body.get("items", {})
         if isinstance(wrapped, dict): items = wrapped.get("item", [])
         elif isinstance(wrapped, list): items = wrapped
+        elif isinstance(wrapped, str): items = []
     if isinstance(items, dict): items = [items]
     if not items and isinstance(root, dict):
         items = root.get("item", [])
@@ -118,7 +123,7 @@ with st.expander("중앙선관위 API 연결 및 선거구별 유권자 원자�
         for label, eid in ELECTIONS.items():
             try:
                 items, total, payload, response = call_district_electors(eid, key, "서울특별시")
-                st.success(f"{label}: 서울특별시 {len(items)}건 수신 (HTTP {response.status_code})")
+                st.success(f"{label}: 서울특별시 응답 {len(items)}행 수신 (HTTP {response.status_code}, API totalCount={total})")
                 if items:
                     st.dataframe(pd.DataFrame(items), use_container_width=True)
                     st.caption("API 응답 원자료입니다. 합계 행과 실제 지역구 행을 구분해 CSV로 정리합니다.")
