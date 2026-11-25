@@ -1,0 +1,1 @@
+v6: 修正全国采集按钮的 NameError。tasks 构建循环和采集处理循环均放入 collect_clicked 条件内；先一次性构建所有 (election, sido) 任务，再统一执行，避免重复处理。

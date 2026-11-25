@@ -138,29 +138,45 @@ with st.expander("중앙선관위 API 연결 및 선거구별 유권자 원자�
                     st.warning(f"{label}: 0건. API 응답: {json.dumps(payload, ensure_ascii=False)[:1200]}")
             except Exception as exc: st.error(f"{label} 테스트 실패: {exc}")
     if collect_clicked and key:
-        collected=[]; errors=[]
-        tasks=[]
-    for label,eid in ELECTIONS.items():
-        sido_list = SIDO_NAMES_2024 if label == "제22대" else SIDO_NAMES_OLD
-        tasks.extend((label,eid,sido) for sido in sido_list)
-        progress=st.progress(0)
-        for i,(label,eid,sido) in enumerate(tasks,1):
+        collected = []
+        errors = []
+        tasks = []
+        for label, eid in ELECTIONS.items():
+            sido_list = SIDO_NAMES_2024 if label == "제22대" else SIDO_NAMES_OLD
+            tasks.extend((label, eid, sido) for sido in sido_list)
+
+        progress = st.progress(0)
+        status = st.empty()
+        for i, (label, eid, sido) in enumerate(tasks, start=1):
+            status.caption(f"수집 중: {label} / {sido} ({i}/{len(tasks)})")
             try:
-                rows=fetch_sido_for_election(eid,key,sido)
+                rows = fetch_sido_for_election(eid, key, sido)
                 for row in rows:
-                    row["총선"]=label; row["선거ID"]=eid; row["조회시도"]=sido
+                    row["총선"] = label
+                    row["선거ID"] = eid
+                    row["조회시도"] = sido
                 collected.extend(rows)
-            except Exception as exc: errors.append(f"{label}/{sido}: {exc}")
-            progress.progress(i/len(tasks))
+            except Exception as exc:
+                errors.append(f"{label} / {sido}: {exc}")
+            progress.progress(i / len(tasks))
+
+        status.empty()
         if collected:
-            raw=pd.DataFrame(collected)
-            st.success(f"전체 수집 결과: {len(raw):,}건")
-            st.dataframe(raw.head(50),use_container_width=True)
-            st.download_button("제20~22대 선거구별 선거인수 CSV 다운로드",raw.to_csv(index=False,encoding="utf-8-sig"),file_name="district_electors_20_22.csv",mime="text/csv")
+            raw = pd.DataFrame(collected)
+            st.success(f"전체 수집 결과: {len(raw):,}행")
+            st.dataframe(raw.head(50), use_container_width=True)
+            st.download_button(
+                "제20~22대 선거구별 선거인수 CSV 다운로드",
+                raw.to_csv(index=False, encoding="utf-8-sig"),
+                file_name="district_electors_20_22.csv",
+                mime="text/csv",
+            )
         if errors:
             with st.expander(f"조회 오류 상세 ({len(errors)}건)"):
-                for error in errors: st.error(error)
-        if not collected: st.error("수집된 자료가 없습니다. 오류 상세의 API 응답코드와 메시지를 확인해 주세요.")
+                for error in errors:
+                    st.error(error)
+        if not collected:
+            st.error("수집된 자료가 없습니다. 오류 상세의 API 응답코드와 메시지를 확인해 주세요.")
 
 # All figures below are national totals / officially reported summary figures.
 # District-level raw population and district-level elector counts are not bundled unless verified.
