@@ -6,6 +6,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
+import folium
+import branca.colormap as bcm
 import streamlit as st
 
 BASE = Path(__file__).parent
@@ -92,65 +94,142 @@ def estimated_population(geo):
     return pd.DataFrame(rows)
 
 def map_figure(geo, table, value_col, title, colors="Blues", categorical=False):
-    # GeoJSON의 properties.SGG_Code(선거구 고유코드)를 기준으로 지도와 데이터를 결합
-    locs=table["SGG_Code"].astype(str).tolist()
-    z=table[value_col].astype(float).tolist()
-    if not locs:
+    """
+    Folium/Leaflet polygon map.
+    Values are attached directly to each GeoJSON feature before rendering,
+    avoiding Plotly Choropleth's strict featureidkey join.
+    """
+    if table.empty:
         raise ValueError("지도에 표시할 선거구 데이터가 없습니다.")
+
+    values = {
+        str(row["SGG_Code"]).strip(): float(row[value_col])
+        for _, row in table.iterrows()
+        if pd.notna(row[value_col])
+    }
+    labels = {
+        str(row["SGG_Code"]).strip(): str(row.get("선거구", row["SGG_Code"]))
+        for _, row in table.iterrows()
+    }
+    regions = {
+        str(row["SGG_Code"]).strip(): str(row.get("시도", ""))
+        for _, row in table.iterrows()
+    }
+
+    features = []
+    for original in geo.get("features", []):
+        feature = json.loads(json.dumps(original))
+        props = feature.setdefault("properties", {})
+        code = str(props.get("SGG_Code", "")).strip()
+        if code not in values:
+            continue
+
+        value = values[code]
+        props["_map_code"] = code
+        props["_map_name"] = labels.get(code, str(props.get("SIDO_SGG", code)))
+        props["_map_region"] = regions.get(code, str(props.get("SIDO", "")))
+        props["_map_value"] = value
+
+        if categorical:
+            if value > 0:
+                fill = "#c94b4b"   # 인접 평균보다 인구가 많음
+            elif value < 0:
+                fill = "#3478c8"   # 인접 평균보다 인구가 적음
+            else:
+                fill = "#a3a3a3"   # 같음
+        else:
+            lo = min(values.values())
+            hi = max(values.values())
+            if hi == lo:
+                t = 0.5
+            else:
+                t = (value - lo) / (hi - lo)
+            # Fixed blue ramp, interpolated without relying on any map join.
+            stops = ["#deebf7", "#9ecae1", "#4292c6", "#08519c"]
+            pos = t * (len(stops) - 1)
+            j = min(int(pos), len(stops) - 2)
+            frac = pos - j
+            def hex_rgb(h):
+                h = h.lstrip("#")
+                return np.array([int(h[k:k+2], 16) for k in (0, 2, 4)], dtype=float)
+            c1 = hex_rgb(stops[j])
+            c2 = hex_rgb(stops[j + 1])
+            rgb = np.round(c1 * (1 - frac) + c2 * frac).astype(int)
+            fill = "#{:02x}{:02x}{:02x}".format(*rgb)
+
+        props["_map_fill"] = fill
+        features.append(feature)
+
+    if not features:
+        raise ValueError(
+            "선택한 선거구와 경계 데이터가 하나도 연결되지 않았습니다. "
+            "선거구 코드(SGG_Code)를 확인해야 합니다."
+        )
+
+    geo_subset = {"type": "FeatureCollection", "features": features}
+    m = folium.Map(
+        location=[36.35, 127.85],
+        zoom_start=7,
+        tiles="CartoDB positron",
+        control_scale=True,
+        prefer_canvas=True,
+    )
+
+    tooltip = folium.GeoJsonTooltip(
+        fields=["_map_region", "_map_name", "_map_value"],
+        aliases=["시도", "선거구", title],
+        localize=True,
+        sticky=False,
+        labels=True,
+        style="background-color: white; color: #222; font-size: 13px; padding: 8px;",
+    )
+
+    layer = folium.GeoJson(
+        data=geo_subset,
+        name=title,
+        style_function=lambda feature: {
+            "fillColor": feature["properties"]["_map_fill"],
+            "color": "#ffffff",
+            "weight": 1.0,
+            "fillOpacity": 0.82,
+            "opacity": 1.0,
+        },
+        highlight_function=lambda feature: {
+            "color": "#222222",
+            "weight": 2.5,
+            "fillOpacity": 0.95,
+        },
+        tooltip=tooltip,
+        smooth_factor=0.5,
+    )
+    layer.add_to(m)
+
+    bounds = layer.get_bounds()
+    if bounds and len(bounds) == 2:
+        m.fit_bounds(bounds, padding=(18, 18), max_zoom=9)
+
     if categorical:
-        scale=[[0,"#3478c8"],[0.499,"#3478c8"],[0.5,"#a3a3a3"],[0.501,"#c94b4b"],[1,"#c94b4b"]]
-        cbar=dict(title="인접 평균 대비",tickvals=[-1,0,1],ticktext=["낮음","같음","높음"])
-        zmin,zmax=-1,1
+        legend = bcm.StepColormap(
+            colors=["#3478c8", "#a3a3a3", "#c94b4b"],
+            index=[-1, -0.5, 0.5, 1],
+            vmin=-1,
+            vmax=1,
+            caption="인접 평균 대비 인구 차이",
+        )
     else:
-        scale=colors
-        cbar=dict(title=title)
-        zmin=zmax=None
-    labels=table["선거구"].astype(str).tolist() if "선거구" in table else locs
-    regions=table["시도"].astype(str).tolist()
-    # Pass only the selected constituency features to Plotly; this prevents the full-country
-    # geometry/ocean canvas from being painted as one solid block when a region filter is active.
-    selected=set(locs)
-    normalized_features=[]
-    for original in geo.get("features",[]):
-        feature=json.loads(json.dumps(original))
-        props=feature.setdefault("properties",{})
-        # Plotly performs a strict type match: locations are strings, so normalize
-        # numeric SGG_Code values in the GeoJSON to strings as well.
-        props["SGG_Code"]=str(props.get("SGG_Code","")).strip()
-        if props["SGG_Code"] in selected:
-            normalized_features.append(feature)
-    geo_subset={"type":"FeatureCollection","features":normalized_features}
-    if not geo_subset["features"]:
-        raise ValueError("선택한 지역의 선거구 코드와 지도 경계가 일치하지 않습니다.")
-    fig=go.Figure(go.Choropleth(
-        geojson=geo_subset, featureidkey="properties.SGG_Code", locations=locs, z=z,
-        colorscale=scale, zmin=zmin, zmax=zmax,
-        marker_line_color="#ffffff", marker_line_width=0.65,
-        colorbar=cbar, customdata=np.column_stack([regions,labels]),
-        hovertemplate="%{customdata[0]} · %{customdata[1]}<br>"+title+": %{z:,.3f}<extra></extra>"
-    ))
-    fig.update_geos(
-        fitbounds="locations",
-        visible=False,
-        projection_type="mercator",
-        bgcolor="white",
-        showland=True,
-        landcolor="#f7f8fa",
-        showocean=False,
-        showlakes=False,
-        showcountries=False,
-        showcoastlines=False,
-        showframe=False,
-        showrivers=False
-    )
-    fig.update_layout(
-        height=650,
-        margin=dict(l=0,r=10,t=10,b=0),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        geo_bgcolor="white"
-    )
-    return fig
+        vals = list(values.values())
+        vmin, vmax = min(vals), max(vals)
+        if vmin == vmax:
+            vmax = vmin + 1
+        legend = bcm.LinearColormap(
+            ["#deebf7", "#9ecae1", "#4292c6", "#08519c"],
+            vmin=vmin,
+            vmax=vmax,
+            caption=title,
+        )
+    legend.add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
+    return m
 
 # 1. Historical max / min / average
 st.divider()
@@ -193,7 +272,8 @@ try:
     left,right=st.columns([1.1,.9],gap="large")
     with left:
         st.markdown("**제22대 선거구 경계 지도**")
-        st.plotly_chart(map_figure(geo,view,value_col,map_metric,"Blues" if map_metric=="모형 추정 인구" else "RdYlBu"),use_container_width=True)
+        folium_map = map_figure(geo,view,value_col,map_metric)
+        st.components.v1.html(folium_map.get_root().render(),height=680,scrolling=False)
     with right:
         st.markdown(f"**{rank_metric} Top 10 · 모형 추정**")
         rcol="주민등록인구_모형추정" if rank_metric=="모형 추정 인구" else "표의 등가성 지수"
@@ -235,7 +315,8 @@ try:
     adj=pd.DataFrame(adjrows)
     adj_region=st.selectbox("지역 필터",["전체"]+sorted(adj["시도"].dropna().unique().tolist()),key="adj_region")
     if adj_region!="전체": adj=adj[adj["시도"]==adj_region]
-    st.plotly_chart(map_figure(geo,adj,"상태","인접 평균 대비",categorical=True),use_container_width=True)
+    folium_adj_map = map_figure(geo,adj,"상태","인접 평균 대비",categorical=True)
+    st.components.v1.html(folium_adj_map.get_root().render(),height=680,scrolling=False)
     x,y,z=st.columns(3)
     x.metric("인접 평균보다 많음",f"{(adj['상태']==1).sum():,}개")
     y.metric("인접 평균보다 적음",f"{(adj['상태']==-1).sum():,}개")
